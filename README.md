@@ -21,7 +21,7 @@
 3. **Multicast UDP**: Audio packets are sent over a multicast UDP channel to all clients in the local network.
 4. **Client Discovery**: Clients periodically broadcast small `PING` packets to detect active peers.
 
-## 📷 Screenshot
+## 📷 Photos
 
 ![Common view](Common_view.jpg)
 
