@@ -12,6 +12,7 @@
 - Peers list (including peer activity) OLED screen
 - Lightweight and easy to use
 - POE support
+- Compatible with VoxShare_gui
 
 ## 🔧 How it works
 
