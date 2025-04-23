@@ -2,7 +2,7 @@
 
 | Peripheral          | Signal Name       | GPIO       | Pin | Notes                                      |
 |---------------------|-------------------|------------|-----|--------------------------------------------|
-| **Ethernet (RMII)** | REF_CLK           | GPIO0      | 25  | 50 MHz clock input from RTL8201F           |
+| **Ethernet (RMII)** | REF_CLK           |            |     | 50MHz clock from external oscillator       |
 |                     | TXD0              | GPIO19     | 31  | Transmit data                              |
 |                     | TXD1              | GPIO22     | 36  |                                            |
 |                     | TX_EN             | GPIO21     | 33  |                                            |
@@ -16,17 +16,19 @@
 | **I²S Shared**      | WS (LRCK)         | GPIO32     | 8   | Word select / Left-Right clock             |
 |                     | SCK (BCLK)        | GPIO33     | 9   | Bit clock                                  |
 | **I²S Microphone**  | SD (data in)      | GPIO34     | 6   | Data from microphone (input only GPIO)     |
-| **I²S Amplifier**   | SD (data out)     | GPIO12     | 14  | Data to speaker amplifier                  |
+| **I²S Amplifier**   | SD (data out)     | GPIO13     | 16  | Data to speaker amplifier                  |
 | **User Button**     | Digital input     | GPIO14     | 13  | Use internal pull-up or external resistor  |
 | **LED Indicator**   | Digital output    | GPIO15     | 23  | Connect LED with current-limiting resistor |
+| **UART**            | RXD               | GPIO3      | 34  | UART receive (programming & debug)         |
+| **UART**            | TXD               | GPIO1      | 35  | UART transmit (programming & debug)        |
 
 ## 🟢 Available GPIOs
-
-| GPIO   | Direction   | Notes                        |
-|--------|-------------|------------------------------|
-| GPIO12 | In/Out      | Available                    |
-| GPIO13 | In/Out      | Available                    |
-| GPIO14 | In/Out      | Available                    |
-| GPIO35 | Input only  | Available (use as input)     |
-| GPIO36 | Input only  | Available (use as input)     |
-| GPIO39 | Input only  | Available (use as input)     |
+|                     |                   |            |     | Notes                                      |
+|---------------------|-------------------|------------|-----|--------------------------------------------|
+|                     |                   | GPIO2      |     | May have onboard LED on some boards        |
+|                     |                   | GPIO12     |     | ⚠️ Affects boot mode if HIGH during boot    |
+|                     |                   | GPIO18     |     | General purpose I/O                        |
+|                     |                   | GPIO23     |     | General purpose I/O                        |
+|                     |                   | GPIO35     |     | Input only                                 |
+|                     |                   | GPIO36     |     | Input only (SVP)                           |
+|                     |                   | GPIO39     |     | Input only (SVN)                           |
