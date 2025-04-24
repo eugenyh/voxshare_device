@@ -18,6 +18,10 @@
 #include "lwip/sockets.h"
 #include "lwip/igmp.h"
 
+#include "esp_timer.h"
+#include "esp_wifi.h"
+#include "esp_netif_defaults.h"
+
 #define TAG "VOXSHARE"
 
 #define SAMPLE_RATE     16000
