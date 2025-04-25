@@ -1,0 +1,6 @@
+# === Sketchup ===
+*.skb
+
+# === Platform-specific ===
+.DS_Store
+Thumbs.db
