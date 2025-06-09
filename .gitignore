@@ -1,9 +1,6 @@
 # C extensions
 *.so
 
-# Distribution / packaging
-Firmware/voxshare_esp/build/
-
 # VSCode
 .vscode/
 
@@ -19,3 +16,4 @@ Thumbs.db
 
 #ZIP
 *.zip
+/Firmware/voxshare_esp/build
