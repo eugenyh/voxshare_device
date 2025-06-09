@@ -16,5 +16,6 @@ Thumbs.db
 
 #ZIP
 *.zip
-/Firmware/voxshare_esp/build
-/Firmware/voxshare_esp/build
+
+#Builds
+/Firmware/voxshare_esp/build/
