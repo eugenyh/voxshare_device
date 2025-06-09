@@ -1,0 +1,21 @@
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+
+# VSCode
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+#text
+*.txt
+
+#ZIP
+*.zip
