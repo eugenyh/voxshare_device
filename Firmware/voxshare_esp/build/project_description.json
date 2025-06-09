@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "voxshare_esp_w5500",
-    "project_version":    "61a1d56-dirty",
+    "project_version":    "526088d-dirty",
     "project_path":       "C:/Users/y.khokhlov/Documents/GitHub/voxshare_device/Firmware/voxshare_esp",
     "idf_path":           "C:/Users/y.khokhlov/esp/v5.4.1/esp-idf",
     "build_dir":          "C:/Users/y.khokhlov/Documents/GitHub/voxshare_device/Firmware/voxshare_esp/build",
