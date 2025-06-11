@@ -4,6 +4,9 @@
 # VSCode
 .vscode/
 
+#Builds
+Firmware/voxshare_esp/build/
+
 # OS files
 .DS_Store
 Thumbs.db
@@ -15,7 +18,12 @@ Thumbs.db
 *.txt
 
 #ZIP
-*.zip
+**/*.zip
 
-#Builds
-Firmware/voxshare_esp/build/
+#7 ZIP
+**/*.7z
+
+#SKB
+*.skb
+
+

@@ -26,7 +26,21 @@
 #include "esp_mac.h"
 #include "w5500.h"
 
+// --- For beep sample generation ---
+#include "math.h"
+
 #define TAG "VOXSHARE"
+
+// --- OPUS ----
+#include "opus.h"
+
+#define OPUS_SAMPLE_RATE      16000
+#define OPUS_CHANNELS         1
+#define OPUS_FRAME_SIZE       320 // 20ms at 16kHz
+#define OPUS_MAX_PACKET_SIZE  1275
+
+static OpusEncoder *opus_encoder = NULL;
+static OpusDecoder *opus_decoder = NULL;
 
 // --- Configuration ---
 #define SAMPLE_RATE 16000
@@ -54,9 +68,9 @@
 #define ETH_SPI_MISO_GPIO 12
 #define ETH_SPI_MOSI_GPIO 13
 #define ETH_CS_GPIO 5
-#define ETH_INT_GPIO -1
-#define ETH_RST_GPIO -1
-#define ETH_SPI_CLOCK_MHZ 20
+#define ETH_INT_GPIO 4
+#define ETH_RST_GPIO 16
+#define ETH_SPI_CLOCK_MHZ 4 
 
 // W5500 PHY Configuration
 #define ETH_PHY_ADDR 1
@@ -129,9 +143,9 @@ void clear_inactive_clients() {
         if (clients[i].ip_addr != 0 && (now - clients[i].last_seen > timeout)) {
             ESP_LOGI(TAG, "Client timed out: %s", inet_ntoa(*(struct in_addr *)&clients[i].ip_addr));
             clients[i].ip_addr = 0;
+            // Флаг теперь сбрасывается только для неактивных клиентов.
             clients[i].has_audio = false;
         }
-        clients[i].has_audio = false;
     }
 }
 
@@ -158,7 +172,16 @@ void init_gpio() {
 }
 
 void init_i2s() {
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM, I2S_ROLE_MASTER);
+    // Before: i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM, I2S_ROLE_MASTER);
+    // New (Define configuration with inreased buffers):
+    i2s_chan_config_t chan_cfg = {
+        .id = I2S_NUM,
+        .role = I2S_ROLE_MASTER,
+        .dma_desc_num = 10, // Increase number of descriptors (as about 6 by default)
+        .dma_frame_num = 240, // Increase frame size (was about 120)
+        .auto_clear = true,
+    };
+
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle, &rx_handle));
 
     i2s_std_config_t std_cfg = {
@@ -197,7 +220,7 @@ esp_err_t init_ethernet() {
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(ETH_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    ESP_ERROR_CHECK(spi_bus_initialize(ETH_SPI_HOST, &buscfg, 1)); //was SPI_DMA_CH_AUTO
 
     spi_device_interface_config_t devcfg = {
         .mode = 0,
@@ -211,6 +234,14 @@ esp_err_t init_ethernet() {
 
     esp_eth_mac_t *mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
     esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_config);
+
+    // Create MAC address for w5500
+    uint8_t custom_mac[6];
+    esp_read_mac(custom_mac, ESP_MAC_WIFI_STA); //Read mac from WIFI
+    custom_mac[0] = 0x02;  // Set local address
+    custom_mac[5] += 1;    // Make it unique
+    ESP_ERROR_CHECK(mac->set_addr(mac, custom_mac)); 
+
     esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
     esp_eth_handle_t eth_handle = NULL;
     ESP_ERROR_CHECK(esp_eth_driver_install(&eth_config, &eth_handle));
@@ -220,6 +251,9 @@ esp_err_t init_ethernet() {
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL));
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));
+
+    ESP_LOGI(TAG, "Initializing Ethernet done.");
+
     return ESP_OK;
 }
 
@@ -269,9 +303,12 @@ void init_udp_socket() {
 
 // --- Tasks ---
 void audio_send_task(void *arg) {
-    int16_t buffer[AUDIO_BLOCK_SIZE];
+    int16_t pcm_buf[AUDIO_BLOCK_SIZE];
+    uint8_t send_buf[3 + OPUS_MAX_PACKET_SIZE];
     size_t bytes_read;
+
     ESP_LOGI(TAG, "Audio Send Task Started");
+
     while (1) {
         if (gpio_get_level(BUTTON_GPIO) == 0) {
             if (!is_transmitting) {
@@ -279,9 +316,26 @@ void audio_send_task(void *arg) {
                 gpio_set_level(LED_GPIO, 1);
                 ESP_LOGI(TAG, "Started Transmitting");
             }
-            esp_err_t err = i2s_channel_read(rx_handle, buffer, sizeof(buffer), &bytes_read, pdMS_TO_TICKS(100));
-            if (err == ESP_OK && bytes_read == sizeof(buffer)) {
-                sendto(udp_socket, buffer, bytes_read, 0, (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
+
+            esp_err_t err = i2s_channel_read(rx_handle, pcm_buf, sizeof(pcm_buf), &bytes_read, pdMS_TO_TICKS(300));
+            if (err == ESP_OK && bytes_read == sizeof(pcm_buf)) {
+                // Заголовок пакета
+                send_buf[0] = 'A';
+                send_buf[1] = 'U';
+                send_buf[2] = 'D';
+
+                int encoded_len = opus_encode(opus_encoder, pcm_buf, AUDIO_BLOCK_SIZE,
+                                              send_buf + 3, OPUS_MAX_PACKET_SIZE);
+                if (encoded_len > 0) {
+                    int sent = sendto(udp_socket, send_buf, encoded_len + 3, 0,
+                                      (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
+                    if (sent < 0) {
+                        ESP_LOGW(TAG, "UDP sendto failed: errno=%d", errno);
+                        vTaskDelay(pdMS_TO_TICKS(50));
+                    }
+                } else {
+                    ESP_LOGE(TAG, "Opus encoding failed: %d", encoded_len);
+                }
             } else {
                 ESP_LOGW(TAG, "I2S Read Error or Timeout: %d, bytes: %d", err, bytes_read);
             }
@@ -299,7 +353,8 @@ void audio_send_task(void *arg) {
 void audio_receive_task(void *arg) {
     struct sockaddr_in source_addr;
     socklen_t socklen = sizeof(source_addr);
-    int16_t rx_buffer[AUDIO_BLOCK_SIZE];
+    uint8_t rx_buf[3 + OPUS_MAX_PACKET_SIZE];
+    int16_t decoded_pcm[AUDIO_BLOCK_SIZE];
     esp_netif_ip_info_t ip_info;
     uint32_t local_ip_addr = 0;
 
@@ -313,23 +368,31 @@ void audio_receive_task(void *arg) {
     }
 
     while (1) {
-        int len = recvfrom(udp_socket, rx_buffer, sizeof(rx_buffer), 0, (struct sockaddr *)&source_addr, &socklen);
+        int len = recvfrom(udp_socket, rx_buf, sizeof(rx_buf), 0, (struct sockaddr *)&source_addr, &socklen);
         if (len < 0) {
             ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        if (len == sizeof(rx_buffer)) {
-            uint32_t sender_ip = source_addr.sin_addr.s_addr;
-            if (!is_transmitting && sender_ip != local_ip_addr) {
-                if (xSemaphoreTake(clients_mutex, portMAX_DELAY) == pdTRUE) {
-                    add_or_update_client(sender_ip, rx_buffer);
-                    xSemaphoreGive(clients_mutex);
+
+        if (len > 3 && rx_buf[0] == 'A' && rx_buf[1] == 'U' && rx_buf[2] == 'D') {
+            int decoded_samples = opus_decode(opus_decoder, rx_buf + 3, len - 3,
+                                              decoded_pcm, AUDIO_BLOCK_SIZE, 0);
+            if (decoded_samples == AUDIO_BLOCK_SIZE) {
+                uint32_t sender_ip = source_addr.sin_addr.s_addr;
+                if (!is_transmitting && sender_ip != local_ip_addr) {
+                    if (xSemaphoreTake(clients_mutex, portMAX_DELAY) == pdTRUE) {
+                        add_or_update_client(sender_ip, decoded_pcm);
+                        xSemaphoreGive(clients_mutex);
+                    }
                 }
+            } else {
+                ESP_LOGE(TAG, "Opus decode failed: %d", decoded_samples);
             }
         }
     }
 }
+
 
 void audio_mix_play_task(void *arg) {
     int32_t mix_buffer[AUDIO_BLOCK_SIZE];
@@ -348,13 +411,18 @@ void audio_mix_play_task(void *arg) {
         memset(mix_buffer, 0, sizeof(mix_buffer));
         int active_clients = 0;
         if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            clear_inactive_clients();
+            // Сначала удаляем "протухших" клиентов
+            clear_inactive_clients(); // Используйте исправленную версию из Варианта 1
+
+            // Затем микшируем аудио от тех, кто прислал данные
             for (int i = 0; i < MAX_CLIENTS; i++) {
                 if (clients[i].ip_addr != 0 && clients[i].has_audio) {
                     active_clients++;
                     for (int j = 0; j < AUDIO_BLOCK_SIZE; j++) {
                         mix_buffer[j] += clients[i].buffer[j];
                     }
+                    // Сбрасываем флаг ПОСЛЕ того, как данные были использованы
+                    clients[i].has_audio = false;
                 }
             }
             xSemaphoreGive(clients_mutex);
@@ -374,6 +442,7 @@ void audio_mix_play_task(void *arg) {
                 ESP_LOGW(TAG, "I2S Write Error or incomplete, bytes: %d", bytes_written);
             }
         } else {
+            // Если активных клиентов не было, отправляем тишину
             memset(final_mix, 0, sizeof(final_mix));
             i2s_channel_write(tx_handle, final_mix, sizeof(final_mix), &bytes_written, pdMS_TO_TICKS(10));
         }
@@ -420,6 +489,41 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t
     xEventGroupSetBits(network_event_group, GOT_IP_BIT);
 }
 
+// Beet test signal generation
+void play_startup_beep() {
+    const float frequency = 3000.0; // 1 kHz tone
+    const float duration = 0.1f;    // 100 ms duration
+    const int num_samples = (int)(SAMPLE_RATE * duration); // 1600 samples
+    
+    // Allocate buffer for samples
+    int16_t *samples = malloc(num_samples * sizeof(int16_t));
+    if (!samples) {
+        ESP_LOGE(TAG, "Failed to allocate memory for beep samples");
+        return;
+    }
+    
+    // Generate sine wave
+    for (int i = 0; i < num_samples; i++) {
+        samples[i] = (int16_t)(32767 * sinf(2 * M_PI * frequency * i / SAMPLE_RATE));
+    }
+    
+    // Send data through I2S
+    size_t bytes_written = 0;
+    esp_err_t ret = i2s_channel_write(tx_handle, samples, 
+                                     num_samples * sizeof(int16_t), 
+                                     &bytes_written, 
+                                     portMAX_DELAY); //pdMS_TO_TICKS(100)
+    
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(ret));
+    }
+    
+    free(samples);
+    
+    // Add small delay to ensure the beep finishes before continuing
+    vTaskDelay(pdMS_TO_TICKS(110));
+}
+
 // --- Main Application ---
 void app_main(void) {
     esp_err_t ret = nvs_flash_init();
@@ -440,7 +544,27 @@ void app_main(void) {
     }
 
     init_gpio();
+
     init_i2s();
+
+    // Checking I2S audio by making a beep test signal
+    play_startup_beep();  
+    
+    // Prepearing OPUS
+    int err;
+    opus_encoder = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_AUDIO, &err);
+    if (err != OPUS_OK) {
+        ESP_LOGE(TAG, "Failed to create Opus encoder: %s", opus_strerror(err));
+        return;
+    }
+
+    opus_decoder = opus_decoder_create(SAMPLE_RATE, 1, &err);
+    if (err != OPUS_OK) {
+        ESP_LOGE(TAG, "Failed to create Opus decoder: %s", opus_strerror(err));
+        return;
+    }
+
+    // Init ethernet
     ESP_ERROR_CHECK(init_ethernet());
 
     ESP_LOGI(TAG, "Waiting for IP address...");
@@ -452,7 +576,7 @@ void app_main(void) {
         if (udp_socket >= 0) {
             xTaskCreate(audio_receive_task, "audio_recv", 4096, NULL, 6, NULL);
             xTaskCreate(audio_mix_play_task, "audio_mix", 4096, NULL, 7, NULL);
-            xTaskCreate(audio_send_task, "audio_send", 4096, NULL, 5, NULL);
+            xTaskCreate(audio_send_task, "audio_send", 4096, NULL, 6, NULL);
         } else {
             ESP_LOGE(TAG, "UDP socket failed to initialize. Cannot start tasks.");
         }
