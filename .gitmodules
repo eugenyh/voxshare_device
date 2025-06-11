@@ -1,0 +1,3 @@
+[submodule "Firmware/voxshare_esp/components/esp-libopus"]
+	path = Firmware/voxshare_esp/components/esp-libopus
+	url = https://github.com/XasWorks/esp-libopus

@@ -1,0 +1,6 @@
+name: voxshare
+version: "0.1.0"
+description: "UDP audio multicast with Opus encoder"
+dependencies:
+  idf: ">=5.0"
+  esp-opus: ">=1.0.0"

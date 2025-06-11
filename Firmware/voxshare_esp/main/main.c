@@ -34,7 +34,7 @@
 // --- OPUS ----
 #include "opus.h"
 
-#define OPUS_SAMPLE_RATE      16000
+// #define OPUS_SAMPLE_RATE      16000
 #define OPUS_CHANNELS         1
 #define OPUS_FRAME_SIZE       320 // 20ms at 16kHz
 #define OPUS_MAX_PACKET_SIZE  1275
@@ -303,8 +303,8 @@ void init_udp_socket() {
 
 // --- Tasks ---
 void audio_send_task(void *arg) {
-    int16_t pcm_buf[AUDIO_BLOCK_SIZE];
-    uint8_t send_buf[3 + OPUS_MAX_PACKET_SIZE];
+    static int16_t pcm_buf[AUDIO_BLOCK_SIZE];
+    static uint8_t send_buf[3 + OPUS_MAX_PACKET_SIZE];
     size_t bytes_read;
 
     ESP_LOGI(TAG, "Audio Send Task Started");
@@ -318,27 +318,34 @@ void audio_send_task(void *arg) {
             }
 
             esp_err_t err = i2s_channel_read(rx_handle, pcm_buf, sizeof(pcm_buf), &bytes_read, pdMS_TO_TICKS(300));
-            if (err == ESP_OK && bytes_read == sizeof(pcm_buf)) {
-                // Заголовок пакета
-                send_buf[0] = 'A';
-                send_buf[1] = 'U';
-                send_buf[2] = 'D';
-
-                int encoded_len = opus_encode(opus_encoder, pcm_buf, AUDIO_BLOCK_SIZE,
-                                              send_buf + 3, OPUS_MAX_PACKET_SIZE);
-                if (encoded_len > 0) {
-                    int sent = sendto(udp_socket, send_buf, encoded_len + 3, 0,
-                                      (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
-                    if (sent < 0) {
-                        ESP_LOGW(TAG, "UDP sendto failed: errno=%d", errno);
-                        vTaskDelay(pdMS_TO_TICKS(50));
-                    }
-                } else {
-                    ESP_LOGE(TAG, "Opus encoding failed: %d", encoded_len);
-                }
-            } else {
+            if (err != ESP_OK || bytes_read != sizeof(pcm_buf)) {
                 ESP_LOGW(TAG, "I2S Read Error or Timeout: %d, bytes: %d", err, bytes_read);
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
             }
+
+            send_buf[0] = 'A';
+            send_buf[1] = 'U';
+            send_buf[2] = 'D';
+
+            memset(send_buf + 3, 0, OPUS_MAX_PACKET_SIZE);
+
+            int encoded_len = opus_encode(opus_encoder, pcm_buf, AUDIO_BLOCK_SIZE,
+                                          send_buf + 3, OPUS_MAX_PACKET_SIZE);
+
+            if (encoded_len <= 0 || encoded_len > OPUS_MAX_PACKET_SIZE) {
+                ESP_LOGE(TAG, "Opus encoding failed or too big: %d", encoded_len);
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
+
+            int sent = sendto(udp_socket, send_buf, encoded_len + 3, 0,
+                              (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
+            if (sent < 0) {
+                ESP_LOGW(TAG, "UDP sendto failed: errno=%d", errno);
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+
         } else {
             if (is_transmitting) {
                 is_transmitting = false;
@@ -349,6 +356,7 @@ void audio_send_task(void *arg) {
         }
     }
 }
+
 
 void audio_receive_task(void *arg) {
     struct sockaddr_in source_addr;
@@ -551,17 +559,21 @@ void app_main(void) {
     play_startup_beep();  
     
     // Prepearing OPUS
-    int err;
-    opus_encoder = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_AUDIO, &err);
-    if (err != OPUS_OK) {
-        ESP_LOGE(TAG, "Failed to create Opus encoder: %s", opus_strerror(err));
+    int opus_err;
+    opus_encoder = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_AUDIO, &opus_err);
+    if (opus_err != OPUS_OK) {
+        ESP_LOGE(TAG, "Failed to create Opus encoder: %s", opus_strerror(opus_err));
         return;
+    } else {
+            ESP_LOGI(TAG, "OPUS encoder created.");
     }
 
-    opus_decoder = opus_decoder_create(SAMPLE_RATE, 1, &err);
-    if (err != OPUS_OK) {
-        ESP_LOGE(TAG, "Failed to create Opus decoder: %s", opus_strerror(err));
+    opus_decoder = opus_decoder_create(SAMPLE_RATE, 1, &opus_err);
+    if (opus_err != OPUS_OK) {
+        ESP_LOGE(TAG, "Failed to create Opus decoder: %s", opus_strerror(opus_err));
         return;
+    } else {
+            ESP_LOGI(TAG, "OPUS decoder created.");
     }
 
     // Init ethernet
@@ -574,9 +586,9 @@ void app_main(void) {
         ESP_LOGI(TAG, "Got IP address. Initializing UDP...");
         init_udp_socket();
         if (udp_socket >= 0) {
-            xTaskCreate(audio_receive_task, "audio_recv", 4096, NULL, 6, NULL);
+            xTaskCreate(audio_receive_task, "audio_recv", 12288, NULL, 6, NULL);
             xTaskCreate(audio_mix_play_task, "audio_mix", 4096, NULL, 7, NULL);
-            xTaskCreate(audio_send_task, "audio_send", 4096, NULL, 6, NULL);
+            xTaskCreate(audio_send_task, "audio_send", 12288, NULL, 6, NULL);
         } else {
             ESP_LOGE(TAG, "UDP socket failed to initialize. Cannot start tasks.");
         }
