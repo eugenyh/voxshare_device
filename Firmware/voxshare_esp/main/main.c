@@ -303,11 +303,29 @@ void init_udp_socket() {
 
 // --- Tasks ---
 void audio_send_task(void *arg) {
-    static int16_t pcm_buf[AUDIO_BLOCK_SIZE];
-    static uint8_t send_buf[3 + OPUS_MAX_PACKET_SIZE];
+
+
+    ESP_LOGI(TAG, "Free internal heap: %u", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+    // static int16_t pcm_buf[AUDIO_BLOCK_SIZE];
+    // static uint8_t send_buf[3 + OPUS_MAX_PACKET_SIZE];
+    uint8_t *raw_buf = heap_caps_malloc(AUDIO_BLOCK_SIZE * sizeof(int16_t), MALLOC_CAP_8BIT);
+    int16_t *pcm_buf = heap_caps_malloc(sizeof(int16_t) * AUDIO_BLOCK_SIZE, MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "New PCM buf addr: %p", pcm_buf);
+
+    // uint8_t *send_buf = heap_caps_malloc(3 + OPUS_MAX_PACKET_SIZE, MALLOC_CAP_INTERNAL);
+    uint8_t *send_buf = heap_caps_malloc(3 + OPUS_MAX_PACKET_SIZE, MALLOC_CAP_DEFAULT);
+
+    ESP_LOGI(TAG, "Allocating buffers: PCM %p, SEND %p", pcm_buf, send_buf);
+
     size_t bytes_read;
 
     ESP_LOGI(TAG, "Audio Send Task Started");
+
+    if (!pcm_buf || !send_buf) {
+    ESP_LOGE(TAG, "Failed to allocate audio buffers!");
+    vTaskDelete(NULL);
+    }
 
     while (1) {
         if (gpio_get_level(BUTTON_GPIO) == 0) {
@@ -317,18 +335,48 @@ void audio_send_task(void *arg) {
                 ESP_LOGI(TAG, "Started Transmitting");
             }
 
-            esp_err_t err = i2s_channel_read(rx_handle, pcm_buf, sizeof(pcm_buf), &bytes_read, pdMS_TO_TICKS(300));
-            if (err != ESP_OK || bytes_read != sizeof(pcm_buf)) {
+            UBaseType_t stack_left = uxTaskGetStackHighWaterMark(NULL);
+            ESP_LOGI(TAG, "Stack left [%s]: %u", pcTaskGetName(NULL), stack_left);
+
+            size_t pcm_buf_size = AUDIO_BLOCK_SIZE * sizeof(int16_t);
+
+            esp_err_t err = i2s_channel_read(rx_handle, raw_buf, AUDIO_BLOCK_SIZE * 2, &bytes_read, pdMS_TO_TICKS(300));
+            if (err != ESP_OK || bytes_read != AUDIO_BLOCK_SIZE * 2) {
+               // обработка ошибки
+               ESP_LOGE(TAG, "Fuck!");
+            }
+
+            // esp_err_t err = ESP_OK;
+            // bytes_read = pcm_buf_size;
+            // static float phase = 0;
+            // for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
+            //      pcm_buf[i] = (int16_t)(10000 * sinf(phase));
+            //      phase += 2.0f * M_PI * 440.0f / SAMPLE_RATE; // 440 Гц
+            //      if (phase > 2.0f * M_PI) phase -= 2.0f * M_PI;
+            // }
+
+
+            // Преобразование LSB → int16_t
+            for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
+                 pcm_buf[i] = (int16_t)((raw_buf[i * 2 + 1] << 8) | raw_buf[i * 2]);
+            }
+
+
+            ESP_LOGI(TAG, "First 5 input samples: %d %d %d %d %d", pcm_buf[0], pcm_buf[1], pcm_buf[2], pcm_buf[3], pcm_buf[4]);
+
+            if (err != ESP_OK || bytes_read != pcm_buf_size) {
                 ESP_LOGW(TAG, "I2S Read Error or Timeout: %d, bytes: %d", err, bytes_read);
                 vTaskDelay(pdMS_TO_TICKS(50));
                 continue;
             }
 
+            // ESP_LOGI(TAG, "Create udp header AUD");
+
             send_buf[0] = 'A';
             send_buf[1] = 'U';
             send_buf[2] = 'D';
 
-            memset(send_buf + 3, 0, OPUS_MAX_PACKET_SIZE);
+            // ESP_LOGI(TAG, "About to encode: encoder=%p, pcm_buf=%p, out_buf=%p", (void*)opus_encoder, (void*)pcm_buf, (void*)send_buf);
 
             int encoded_len = opus_encode(opus_encoder, pcm_buf, AUDIO_BLOCK_SIZE,
                                           send_buf + 3, OPUS_MAX_PACKET_SIZE);
@@ -339,8 +387,13 @@ void audio_send_task(void *arg) {
                 continue;
             }
 
+            assert(udp_socket >= 0);
+            // ESP_LOGI(TAG, "Sending to socket %d", udp_socket);
+            // ESP_LOGI(TAG, "Dest IP: 0x%08x, port: %d", (unsigned int)ntohl(mcast_addr.sin_addr.s_addr), ntohs(mcast_addr.sin_port));
+
             int sent = sendto(udp_socket, send_buf, encoded_len + 3, 0,
                               (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
+
             if (sent < 0) {
                 ESP_LOGW(TAG, "UDP sendto failed: errno=%d", errno);
                 vTaskDelay(pdMS_TO_TICKS(50));
@@ -355,28 +408,44 @@ void audio_send_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(50));
         }
     }
+
+    free(pcm_buf);
+    free(send_buf);
 }
 
 
 void audio_receive_task(void *arg) {
     struct sockaddr_in source_addr;
     socklen_t socklen = sizeof(source_addr);
-    uint8_t rx_buf[3 + OPUS_MAX_PACKET_SIZE];
-    int16_t decoded_pcm[AUDIO_BLOCK_SIZE];
+
+    // Выделяем память в куче (DEFAULT достаточно)
+    uint8_t *rx_buf = heap_caps_malloc(3 + OPUS_MAX_PACKET_SIZE, MALLOC_CAP_DEFAULT);
+    int16_t *decoded_pcm = heap_caps_malloc(sizeof(int16_t) * AUDIO_BLOCK_SIZE, MALLOC_CAP_DEFAULT);
+
     esp_netif_ip_info_t ip_info;
     uint32_t local_ip_addr = 0;
 
     ESP_LOGI(TAG, "Audio Receive Task Started");
 
+    if (!rx_buf || !decoded_pcm) {
+        ESP_LOGE(TAG, "Failed to allocate memory for audio_receive_task");
+        vTaskDelete(NULL);
+    }
+
     if (s_eth_netif) {
-        esp_netif_get_ip_info(s_eth_netif, &ip_info);
-        local_ip_addr = ip_info.ip.addr;
+        if (esp_netif_get_ip_info(s_eth_netif, &ip_info) == ESP_OK) {
+            local_ip_addr = ip_info.ip.addr;
+            ESP_LOGI(TAG, "Local IP: " IPSTR, IP2STR(&ip_info.ip));
+        } else {
+            ESP_LOGE(TAG, "Failed to get IP info");
+        }
     } else {
-        ESP_LOGE(TAG, "Failed to get Ethernet netif handle");
+        ESP_LOGE(TAG, "Ethernet netif handle is NULL");
     }
 
     while (1) {
-        int len = recvfrom(udp_socket, rx_buf, sizeof(rx_buf), 0, (struct sockaddr *)&source_addr, &socklen);
+        int len = recvfrom(udp_socket, rx_buf, 3 + OPUS_MAX_PACKET_SIZE, 0,
+                           (struct sockaddr *)&source_addr, &socklen);
         if (len < 0) {
             ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -384,10 +453,20 @@ void audio_receive_task(void *arg) {
         }
 
         if (len > 3 && rx_buf[0] == 'A' && rx_buf[1] == 'U' && rx_buf[2] == 'D') {
-            int decoded_samples = opus_decode(opus_decoder, rx_buf + 3, len - 3,
-                                              decoded_pcm, AUDIO_BLOCK_SIZE, 0);
+            int decoded_samples = opus_decode(opus_decoder,
+                                              rx_buf + 3,
+                                              len - 3,
+                                              decoded_pcm,
+                                              AUDIO_BLOCK_SIZE,
+                                              0);
+
+            ESP_LOGI(TAG, "First 5 decoded samples: %d %d %d %d %d",
+                     decoded_pcm[0], decoded_pcm[1], decoded_pcm[2], decoded_pcm[3], decoded_pcm[4]);                                  
+
             if (decoded_samples == AUDIO_BLOCK_SIZE) {
                 uint32_t sender_ip = source_addr.sin_addr.s_addr;
+
+                // Игнорируем собственные пакеты, если передача активна
                 if (!is_transmitting && sender_ip != local_ip_addr) {
                     if (xSemaphoreTake(clients_mutex, portMAX_DELAY) == pdTRUE) {
                         add_or_update_client(sender_ip, decoded_pcm);
@@ -399,7 +478,11 @@ void audio_receive_task(void *arg) {
             }
         }
     }
+
+    free(rx_buf);
+    free(decoded_pcm);
 }
+
 
 
 void audio_mix_play_task(void *arg) {
@@ -586,9 +669,9 @@ void app_main(void) {
         ESP_LOGI(TAG, "Got IP address. Initializing UDP...");
         init_udp_socket();
         if (udp_socket >= 0) {
-            xTaskCreate(audio_receive_task, "audio_recv", 12288, NULL, 6, NULL);
+            xTaskCreate(audio_receive_task, "audio_recv", 28672, NULL, 6, NULL);
             xTaskCreate(audio_mix_play_task, "audio_mix", 4096, NULL, 7, NULL);
-            xTaskCreate(audio_send_task, "audio_send", 12288, NULL, 6, NULL);
+            xTaskCreate(audio_send_task, "audio_send", 28672, NULL, 6, NULL);
         } else {
             ESP_LOGE(TAG, "UDP socket failed to initialize. Cannot start tasks.");
         }
