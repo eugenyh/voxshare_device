@@ -336,7 +336,7 @@ void audio_send_task(void *arg) {
             }
 
             UBaseType_t stack_left = uxTaskGetStackHighWaterMark(NULL);
-            ESP_LOGI(TAG, "Stack left [%s]: %u", pcTaskGetName(NULL), stack_left);
+            // ESP_LOGI(TAG, "Stack left [%s]: %u", pcTaskGetName(NULL), stack_left);
 
             size_t pcm_buf_size = AUDIO_BLOCK_SIZE * sizeof(int16_t);
 
@@ -357,9 +357,15 @@ void audio_send_task(void *arg) {
 
 
             // Преобразование LSB → int16_t
-            for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
-                 pcm_buf[i] = (int16_t)((raw_buf[i * 2 + 1] << 8) | raw_buf[i * 2]);
-            }
+            // for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
+            //     pcm_buf[i] = (int16_t)((raw_buf[i * 2 + 1] << 8) | raw_buf[i * 2]);
+            // }
+
+            // Преобразование MSB (I2S standard) → int16_t
+            // for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
+                 // Сначала идет старший байт (MSB), затем младший (LSB)
+            //     pcm_buf[i] = (int16_t)((raw_buf[i * 2] << 8) | raw_buf[i * 2 + 1]);
+            // }
 
 
             ESP_LOGI(TAG, "First 5 input samples: %d %d %d %d %d", pcm_buf[0], pcm_buf[1], pcm_buf[2], pcm_buf[3], pcm_buf[4]);
@@ -378,9 +384,11 @@ void audio_send_task(void *arg) {
 
             // ESP_LOGI(TAG, "About to encode: encoder=%p, pcm_buf=%p, out_buf=%p", (void*)opus_encoder, (void*)pcm_buf, (void*)send_buf);
 
-            int encoded_len = opus_encode(opus_encoder, pcm_buf, AUDIO_BLOCK_SIZE,
-                                          send_buf + 3, OPUS_MAX_PACKET_SIZE);
 
+            memcpy(send_buf + 3, raw_buf, AUDIO_BLOCK_SIZE * sizeof(int16_t));
+            int encoded_len = AUDIO_BLOCK_SIZE * sizeof(int16_t);
+            // !!!! int encoded_len = opus_encode(opus_encoder, pcm_buf, AUDIO_BLOCK_SIZE, send_buf + 3, OPUS_MAX_PACKET_SIZE);
+             
             if (encoded_len <= 0 || encoded_len > OPUS_MAX_PACKET_SIZE) {
                 ESP_LOGE(TAG, "Opus encoding failed or too big: %d", encoded_len);
                 vTaskDelay(pdMS_TO_TICKS(50));
@@ -453,12 +461,11 @@ void audio_receive_task(void *arg) {
         }
 
         if (len > 3 && rx_buf[0] == 'A' && rx_buf[1] == 'U' && rx_buf[2] == 'D') {
-            int decoded_samples = opus_decode(opus_decoder,
-                                              rx_buf + 3,
-                                              len - 3,
-                                              decoded_pcm,
-                                              AUDIO_BLOCK_SIZE,
-                                              0);
+
+            
+            //int decoded_samples = opus_decode(opus_decoder, rx_buf + 3, len - 3, decoded_pcm, AUDIO_BLOCK_SIZE, 0);
+            memcpy(decoded_pcm, rx_buf + 3, AUDIO_BLOCK_SIZE * sizeof(int16_t));
+            int decoded_samples = AUDIO_BLOCK_SIZE;
 
             ESP_LOGI(TAG, "First 5 decoded samples: %d %d %d %d %d",
                      decoded_pcm[0], decoded_pcm[1], decoded_pcm[2], decoded_pcm[3], decoded_pcm[4]);                                  
