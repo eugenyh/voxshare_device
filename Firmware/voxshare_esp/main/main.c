@@ -31,10 +31,13 @@
 
 #define TAG "VOXSHARE"
 
+#define SINUS_SEND_TO_I2S     0
+
 // --- OPUS ----
 #include "opus.h"
 
-// #define OPUS_SAMPLE_RATE      16000
+#define USE_OPUS_CODEC        1
+
 #define OPUS_CHANNELS         1
 #define OPUS_FRAME_SIZE       320 // 20ms at 16kHz
 #define OPUS_MAX_PACKET_SIZE  1275
@@ -172,7 +175,6 @@ void init_gpio() {
 }
 
 void init_i2s() {
-    // Before: i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM, I2S_ROLE_MASTER);
     // New (Define configuration with inreased buffers):
     i2s_chan_config_t chan_cfg = {
         .id = I2S_NUM,
@@ -303,28 +305,18 @@ void init_udp_socket() {
 
 // --- Tasks ---
 void audio_send_task(void *arg) {
-
-
     ESP_LOGI(TAG, "Free internal heap: %u", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-
-    // static int16_t pcm_buf[AUDIO_BLOCK_SIZE];
-    // static uint8_t send_buf[3 + OPUS_MAX_PACKET_SIZE];
-    uint8_t *raw_buf = heap_caps_malloc(AUDIO_BLOCK_SIZE * sizeof(int16_t), MALLOC_CAP_8BIT);
-    int16_t *pcm_buf = heap_caps_malloc(sizeof(int16_t) * AUDIO_BLOCK_SIZE, MALLOC_CAP_8BIT);
-    ESP_LOGI(TAG, "New PCM buf addr: %p", pcm_buf);
-
-    // uint8_t *send_buf = heap_caps_malloc(3 + OPUS_MAX_PACKET_SIZE, MALLOC_CAP_INTERNAL);
+ 
+    uint8_t *raw_buf = heap_caps_malloc(AUDIO_BLOCK_SIZE * 2, MALLOC_CAP_8BIT);
+    int16_t *pcm_buf = heap_caps_malloc(AUDIO_BLOCK_SIZE * sizeof(int16_t), MALLOC_CAP_8BIT);    
     uint8_t *send_buf = heap_caps_malloc(3 + OPUS_MAX_PACKET_SIZE, MALLOC_CAP_DEFAULT);
-
     ESP_LOGI(TAG, "Allocating buffers: PCM %p, SEND %p", pcm_buf, send_buf);
-
-    size_t bytes_read;
 
     ESP_LOGI(TAG, "Audio Send Task Started");
 
     if (!pcm_buf || !send_buf) {
-    ESP_LOGE(TAG, "Failed to allocate audio buffers!");
-    vTaskDelete(NULL);
+        ESP_LOGE(TAG, "Failed to allocate audio buffers!");
+        vTaskDelete(NULL);
     }
 
     while (1) {
@@ -335,38 +327,27 @@ void audio_send_task(void *arg) {
                 ESP_LOGI(TAG, "Started Transmitting");
             }
 
-            UBaseType_t stack_left = uxTaskGetStackHighWaterMark(NULL);
-            // ESP_LOGI(TAG, "Stack left [%s]: %u", pcTaskGetName(NULL), stack_left);
-
+            size_t bytes_read;
             size_t pcm_buf_size = AUDIO_BLOCK_SIZE * sizeof(int16_t);
 
-            esp_err_t err = i2s_channel_read(rx_handle, raw_buf, AUDIO_BLOCK_SIZE * 2, &bytes_read, pdMS_TO_TICKS(300));
-            if (err != ESP_OK || bytes_read != AUDIO_BLOCK_SIZE * 2) {
-               // обработка ошибки
-               ESP_LOGE(TAG, "Fuck!");
-            }
+            #if SINUS_SEND_TO_I2S
+            // --- Generate SINUS to pcm_buf ---
+                esp_err_t err = ESP_OK;
+                bytes_read = pcm_buf_size;
+                static float phase = 0;
+                for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
+                     pcm_buf[i] = (int16_t)(10000 * sinf(phase));
+                     phase += 2.0f * M_PI * 440.0f / SAMPLE_RATE; // 440 Гц
+                     if (phase > 2.0f * M_PI) phase -= 2.0f * M_PI;
+                }
+            #else
+                // it was: esp_err_t err = i2s_channel_read(rx_handle, pcm_buf, pcm_buf_size, &bytes_read, pdMS_TO_TICKS(300));
+                esp_err_t err = i2s_channel_read(rx_handle, raw_buf, AUDIO_BLOCK_SIZE * 2, &bytes_read, pdMS_TO_TICKS(300));
 
-            // esp_err_t err = ESP_OK;
-            // bytes_read = pcm_buf_size;
-            // static float phase = 0;
-            // for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
-            //      pcm_buf[i] = (int16_t)(10000 * sinf(phase));
-            //      phase += 2.0f * M_PI * 440.0f / SAMPLE_RATE; // 440 Гц
-            //      if (phase > 2.0f * M_PI) phase -= 2.0f * M_PI;
-            // }
-
-
-            // Преобразование LSB → int16_t
-            // for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
-            //     pcm_buf[i] = (int16_t)((raw_buf[i * 2 + 1] << 8) | raw_buf[i * 2]);
-            // }
-
-            // Преобразование MSB (I2S standard) → int16_t
-            // for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
-                 // Сначала идет старший байт (MSB), затем младший (LSB)
-            //     pcm_buf[i] = (int16_t)((raw_buf[i * 2] << 8) | raw_buf[i * 2 + 1]);
-            // }
-
+                for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
+                     pcm_buf[i] = (int16_t)((raw_buf[2 * i + 1] << 8) | raw_buf[2 * i]);
+                }
+            #endif
 
             ESP_LOGI(TAG, "First 5 input samples: %d %d %d %d %d", pcm_buf[0], pcm_buf[1], pcm_buf[2], pcm_buf[3], pcm_buf[4]);
 
@@ -376,18 +357,16 @@ void audio_send_task(void *arg) {
                 continue;
             }
 
-            // ESP_LOGI(TAG, "Create udp header AUD");
-
             send_buf[0] = 'A';
             send_buf[1] = 'U';
             send_buf[2] = 'D';
 
-            // ESP_LOGI(TAG, "About to encode: encoder=%p, pcm_buf=%p, out_buf=%p", (void*)opus_encoder, (void*)pcm_buf, (void*)send_buf);
-
-
-            memcpy(send_buf + 3, raw_buf, AUDIO_BLOCK_SIZE * sizeof(int16_t));
-            int encoded_len = AUDIO_BLOCK_SIZE * sizeof(int16_t);
-            // !!!! int encoded_len = opus_encode(opus_encoder, pcm_buf, AUDIO_BLOCK_SIZE, send_buf + 3, OPUS_MAX_PACKET_SIZE);
+            #if USE_OPUS_CODEC
+                int encoded_len = opus_encode(opus_encoder, pcm_buf, AUDIO_BLOCK_SIZE, send_buf + 3, OPUS_MAX_PACKET_SIZE);
+            #else
+                int encoded_len = AUDIO_BLOCK_SIZE * sizeof(int16_t);
+                memcpy(send_buf + 3, pcm_buf, AUDIO_BLOCK_SIZE * sizeof(int16_t));
+            #endif
              
             if (encoded_len <= 0 || encoded_len > OPUS_MAX_PACKET_SIZE) {
                 ESP_LOGE(TAG, "Opus encoding failed or too big: %d", encoded_len);
@@ -395,12 +374,10 @@ void audio_send_task(void *arg) {
                 continue;
             }
 
+            // Check socket ready before sending
             assert(udp_socket >= 0);
-            // ESP_LOGI(TAG, "Sending to socket %d", udp_socket);
-            // ESP_LOGI(TAG, "Dest IP: 0x%08x, port: %d", (unsigned int)ntohl(mcast_addr.sin_addr.s_addr), ntohs(mcast_addr.sin_port));
 
-            int sent = sendto(udp_socket, send_buf, encoded_len + 3, 0,
-                              (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
+            int sent = sendto(udp_socket, send_buf, encoded_len + 3, 0, (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
 
             if (sent < 0) {
                 ESP_LOGW(TAG, "UDP sendto failed: errno=%d", errno);
@@ -416,18 +393,17 @@ void audio_send_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(50));
         }
     }
-
+    free(raw_buf);
     free(pcm_buf);
     free(send_buf);
 }
-
 
 void audio_receive_task(void *arg) {
     struct sockaddr_in source_addr;
     socklen_t socklen = sizeof(source_addr);
 
     // Выделяем память в куче (DEFAULT достаточно)
-    uint8_t *rx_buf = heap_caps_malloc(3 + OPUS_MAX_PACKET_SIZE, MALLOC_CAP_DEFAULT);
+    uint8_t *rx_buf = heap_caps_malloc(OPUS_MAX_PACKET_SIZE + 3, MALLOC_CAP_DEFAULT);
     int16_t *decoded_pcm = heap_caps_malloc(sizeof(int16_t) * AUDIO_BLOCK_SIZE, MALLOC_CAP_DEFAULT);
 
     esp_netif_ip_info_t ip_info;
@@ -462,10 +438,12 @@ void audio_receive_task(void *arg) {
 
         if (len > 3 && rx_buf[0] == 'A' && rx_buf[1] == 'U' && rx_buf[2] == 'D') {
 
-            
-            //int decoded_samples = opus_decode(opus_decoder, rx_buf + 3, len - 3, decoded_pcm, AUDIO_BLOCK_SIZE, 0);
-            memcpy(decoded_pcm, rx_buf + 3, AUDIO_BLOCK_SIZE * sizeof(int16_t));
-            int decoded_samples = AUDIO_BLOCK_SIZE;
+            #if USE_OPUS_CODEC
+                int decoded_samples = opus_decode(opus_decoder, rx_buf + 3, len - 3, decoded_pcm, AUDIO_BLOCK_SIZE, 0);
+            #else
+                int decoded_samples = AUDIO_BLOCK_SIZE;
+                memcpy(decoded_pcm, rx_buf + 3, AUDIO_BLOCK_SIZE * sizeof(int16_t));
+            #endif
 
             ESP_LOGI(TAG, "First 5 decoded samples: %d %d %d %d %d",
                      decoded_pcm[0], decoded_pcm[1], decoded_pcm[2], decoded_pcm[3], decoded_pcm[4]);                                  
@@ -649,22 +627,28 @@ void app_main(void) {
     play_startup_beep();  
     
     // Prepearing OPUS
-    int opus_err;
-    opus_encoder = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_AUDIO, &opus_err);
-    if (opus_err != OPUS_OK) {
-        ESP_LOGE(TAG, "Failed to create Opus encoder: %s", opus_strerror(opus_err));
-        return;
-    } else {
-            ESP_LOGI(TAG, "OPUS encoder created.");
-    }
+    #if USE_OPUS_CODEC
 
-    opus_decoder = opus_decoder_create(SAMPLE_RATE, 1, &opus_err);
-    if (opus_err != OPUS_OK) {
-        ESP_LOGE(TAG, "Failed to create Opus decoder: %s", opus_strerror(opus_err));
-        return;
-    } else {
-            ESP_LOGI(TAG, "OPUS decoder created.");
-    }
+    int opus_err;
+        ESP_LOGI(TAG, "Using OPUS codec.");
+        opus_encoder = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_AUDIO, &opus_err);
+        if (opus_err != OPUS_OK) {
+            ESP_LOGE(TAG, "Failed to create Opus encoder: %s", opus_strerror(opus_err));
+            return;
+        } else {
+                ESP_LOGI(TAG, "OPUS encoder created.");
+        }
+
+        opus_decoder = opus_decoder_create(SAMPLE_RATE, 1, &opus_err);
+        if (opus_err != OPUS_OK) {
+            ESP_LOGE(TAG, "Failed to create Opus decoder: %s", opus_strerror(opus_err));
+            return;
+        } else {
+                ESP_LOGI(TAG, "OPUS decoder created.");
+        }
+    #else
+        ESP_LOGI(TAG, "Using PCM audio.");
+    #endif
 
     // Init ethernet
     ESP_ERROR_CHECK(init_ethernet());
