@@ -48,7 +48,7 @@
 #define USE_OPUS_CODEC        1
 #define OPUS_CHANNELS         1
 #define OPUS_FRAME_SIZE       320 // 20ms at 16kHz
-#define OPUS_MAX_PACKET_SIZE  1275
+#define OPUS_MAX_PACKET_SIZE  400 // max 1275
 
 static OpusEncoder *opus_encoder = NULL;
 static OpusDecoder *opus_decoder = NULL;
@@ -302,7 +302,7 @@ esp_err_t init_ethernet() {
         .mode = 0,
         .clock_speed_hz = ETH_SPI_CLOCK_MHZ * 1000 * 1000,
         .spics_io_num = ETH_CS_GPIO,
-        .queue_size = 20,  // можно увеличить до 50 при необходимости
+        .queue_size = 50,  // можно увеличить до 50 при необходимости
     };
 
     eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(ETH_SPI_HOST, &devcfg);
@@ -339,6 +339,7 @@ esp_err_t init_ethernet() {
 
 void init_udp_socket() {
     ESP_LOGI(TAG, "Initializing UDP Socket");
+
     udp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udp_socket < 0) {
         ESP_LOGE(TAG, "Failed to create UDP socket: errno %d", errno);
@@ -348,8 +349,9 @@ void init_udp_socket() {
     struct sockaddr_in local_addr = {
         .sin_family = AF_INET,
         .sin_port = htons(MULTICAST_PORT),
-        .sin_addr.s_addr = htonl(INADDR_ANY)
+        .sin_addr.s_addr = htonl(INADDR_ANY) // Принять с любого интерфейса
     };
+
     if (bind(udp_socket, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
         ESP_LOGE(TAG, "Failed to bind UDP socket: errno %d", errno);
         close(udp_socket);
@@ -357,10 +359,12 @@ void init_udp_socket() {
         return;
     }
 
-    ip_mreq mreq = {
+    // Присоединяемся к multicast-группе
+    struct ip_mreq mreq = {
         .imr_multiaddr.s_addr = inet_addr(MULTICAST_ADDR),
-        .imr_interface.s_addr = htonl(INADDR_ANY)
+        .imr_interface.s_addr = htonl(INADDR_ANY) // Можно заменить на IP устройства, если нужно
     };
+
     if (setsockopt(udp_socket, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
         ESP_LOGE(TAG, "Failed to join multicast group: errno %d", errno);
         close(udp_socket);
@@ -368,11 +372,17 @@ void init_udp_socket() {
         return;
     }
 
+    // Отключаем приём собственных multicast-пакетов
     char loopch = 0;
     if (setsockopt(udp_socket, IPPROTO_IP, IP_MULTICAST_LOOP, &loopch, sizeof(loopch)) < 0) {
         ESP_LOGW(TAG, "Failed to disable multicast loopback: errno %d", errno);
     }
 
+    // Опционально: выставим TTL для multicast
+    // char ttl = 1;
+    // setsockopt(udp_socket, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+
+    // Адрес, на который будут отправляться пакеты
     bzero(&mcast_addr, sizeof(mcast_addr));
     mcast_addr.sin_family = AF_INET;
     mcast_addr.sin_addr.s_addr = inet_addr(MULTICAST_ADDR);
@@ -448,18 +458,6 @@ void audio_send_task(void *arg) {
 
             #if USE_OPUS_CODEC
                 int encoded_len = opus_encode(opus_encoder, pcm_buf, AUDIO_BLOCK_SIZE, send_buf + 3, OPUS_MAX_PACKET_SIZE);
-
-                // int decoded_samples = opus_decode(opus_decoder, send_buf + 3, encoded_len, pcm_buf, AUDIO_BLOCK_SIZE, 0);
-
-                //if (decoded_samples == AUDIO_BLOCK_SIZE) {
-                    // ESP_LOGI(TAG, "First 5 decoded samples: %d %d %d %d %d", pcm_buf[0], pcm_buf[1], pcm_buf[2], pcm_buf[3], pcm_buf[4]);
-
-                //    size_t bytes_written;
-                //    i2s_channel_write(tx_handle, pcm_buf, pcm_buf_size, &bytes_written, portMAX_DELAY);
-
-                //} else {
-                //    ESP_LOGW(TAG, "Wrong decoded bytes: %d", decoded_samples);
-                //}
             #else
                 int encoded_len = AUDIO_BLOCK_SIZE * sizeof(int16_t);
                 memcpy(send_buf + 3, pcm_buf, AUDIO_BLOCK_SIZE * sizeof(int16_t));
@@ -572,8 +570,8 @@ void audio_receive_task(void *arg) {
                 memcpy(decoded_pcm, rx_buf + 3, AUDIO_BLOCK_SIZE * sizeof(int16_t));
             #endif
 
-            ESP_LOGI(TAG, "First 5 decoded samples: %d %d %d %d %d",
-                     decoded_pcm[0], decoded_pcm[1], decoded_pcm[2], decoded_pcm[3], decoded_pcm[4]);                                  
+            // ESP_LOGI(TAG, "First 5 decoded samples: %d %d %d %d %d",
+            //         decoded_pcm[0], decoded_pcm[1], decoded_pcm[2], decoded_pcm[3], decoded_pcm[4]);                                  
 
             if (decoded_samples == AUDIO_BLOCK_SIZE) {
                 uint32_t sender_ip = source_addr.sin_addr.s_addr;
@@ -616,7 +614,7 @@ void audio_mix_play_task(void *arg) {
         int active_clients = 0;
         if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             // Сначала удаляем "протухших" клиентов
-            clear_inactive_clients(); // Используйте исправленную версию из Варианта 1
+            clear_inactive_clients(); 
 
             // Затем микшируем аудио от тех, кто прислал данные
             for (int i = 0; i < MAX_CLIENTS; i++) {
