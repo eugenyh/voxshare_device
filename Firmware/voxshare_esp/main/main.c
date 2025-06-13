@@ -25,25 +25,13 @@
 #include "driver/spi_master.h"
 #include "esp_mac.h"
 #include "w5500.h"
+#include "opus.h"
 
 // --- For beep sample generation ---
 #include "math.h"
 
 #define TAG "VOXSHARE"
-
 #define SINUS_SEND_TO_I2S     0
-
-// --- OPUS ----
-#include "opus.h"
-
-#define USE_OPUS_CODEC        1
-
-#define OPUS_CHANNELS         1
-#define OPUS_FRAME_SIZE       320 // 20ms at 16kHz
-#define OPUS_MAX_PACKET_SIZE  1275
-
-static OpusEncoder *opus_encoder = NULL;
-static OpusDecoder *opus_decoder = NULL;
 
 // --- Configuration ---
 #define PACKET_TYPE_PING      "PING"
@@ -56,6 +44,14 @@ static OpusDecoder *opus_decoder = NULL;
 #define AUDIO_BLOCK_SIZE 320
 #define MAX_CLIENTS      16
 #define MIX_INTERVAL_MS  20
+
+#define USE_OPUS_CODEC        1
+#define OPUS_CHANNELS         1
+#define OPUS_FRAME_SIZE       320 // 20ms at 16kHz
+#define OPUS_MAX_PACKET_SIZE  1275
+
+static OpusEncoder *opus_encoder = NULL;
+static OpusDecoder *opus_decoder = NULL;
 
 #define CLIENT_TIMEOUT_MS 5000
 #define CLIENT_NICK_SIZE  32
@@ -249,20 +245,23 @@ void init_gpio() {
 }
 
 void init_i2s() {
-    // New (Define configuration with inreased buffers):
     i2s_chan_config_t chan_cfg = {
         .id = I2S_NUM,
         .role = I2S_ROLE_MASTER,
-        .dma_desc_num = 10, // Increase number of descriptors (as about 6 by default)
-        .dma_frame_num = 240, // Increase frame size (was about 120)
+        .dma_desc_num = 10,
+        .dma_frame_num = 240,
         .auto_clear = true,
     };
 
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle, &rx_handle));
 
     i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .clk_cfg = {
+            .sample_rate_hz = SAMPLE_RATE,
+            .clk_src = I2S_CLK_SRC_DEFAULT,
+            .mclk_multiple = I2S_MCLK_MULTIPLE_384  
+        },
+        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_24BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = I2S_BCK_IO,
@@ -271,11 +270,13 @@ void init_i2s() {
             .din = I2S_DATA_IN_IO,
         },
     };
+
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
     ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
 }
+
 
 esp_err_t init_ethernet() {
     ESP_LOGI(TAG, "Initializing Ethernet...");
@@ -381,10 +382,16 @@ void init_udp_socket() {
 void audio_send_task(void *arg) {
     ESP_LOGI(TAG, "Free internal heap: %u", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
  
-    uint8_t *raw_buf = heap_caps_malloc(AUDIO_BLOCK_SIZE * 2, MALLOC_CAP_8BIT);
-    int16_t *pcm_buf = heap_caps_malloc(AUDIO_BLOCK_SIZE * sizeof(int16_t), MALLOC_CAP_8BIT);    
+    size_t raw_buf_size = AUDIO_BLOCK_SIZE * sizeof(uint32_t);
+    uint32_t *raw_buf = heap_caps_malloc(raw_buf_size, MALLOC_CAP_8BIT);
+
+    size_t pcm_buf_size = AUDIO_BLOCK_SIZE * sizeof(int16_t);
+    int16_t *pcm_buf = heap_caps_malloc(pcm_buf_size, MALLOC_CAP_8BIT);    
+
+    size_t send_buf_size = OPUS_MAX_PACKET_SIZE + 3;
     uint8_t *send_buf = heap_caps_malloc(3 + OPUS_MAX_PACKET_SIZE, MALLOC_CAP_DEFAULT);
-    ESP_LOGI(TAG, "Allocating buffers: PCM %p, SEND %p", pcm_buf, send_buf);
+
+    ESP_LOGI(TAG, "Allocating buffers: RAW %p, PCM %p, SEND %p", raw_buf, pcm_buf, send_buf);
 
     ESP_LOGI(TAG, "Audio Send Task Started");
 
@@ -402,8 +409,7 @@ void audio_send_task(void *arg) {
             }
 
             size_t bytes_read;
-            size_t pcm_buf_size = AUDIO_BLOCK_SIZE * sizeof(int16_t);
-
+            
             #if SINUS_SEND_TO_I2S
             // --- Generate SINUS to pcm_buf ---
                 esp_err_t err = ESP_OK;
@@ -416,16 +422,18 @@ void audio_send_task(void *arg) {
                 }
             #else
                 // it was: esp_err_t err = i2s_channel_read(rx_handle, pcm_buf, pcm_buf_size, &bytes_read, pdMS_TO_TICKS(300));
-                esp_err_t err = i2s_channel_read(rx_handle, raw_buf, AUDIO_BLOCK_SIZE * 2, &bytes_read, pdMS_TO_TICKS(300));
+                esp_err_t err = i2s_channel_read(rx_handle, raw_buf, raw_buf_size, &bytes_read, portMAX_DELAY); 
 
                 for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
-                     pcm_buf[i] = (int16_t)((raw_buf[2 * i + 1] << 8) | raw_buf[2 * i]);
+                //  Предположим, данные приходят MSB-first, 24 бита значащие
+                    int32_t sample = (int32_t)(raw_buf[i] << 8);  // Приводим 24-бит к 32-бит со знаком
+                    pcm_buf[i] = sample >> 16;  // Масштабируем до 16 бит
                 }
             #endif
 
-            ESP_LOGI(TAG, "First 5 input samples: %d %d %d %d %d", pcm_buf[0], pcm_buf[1], pcm_buf[2], pcm_buf[3], pcm_buf[4]);
+            // ESP_LOGI(TAG, "First 5 input samples: %d %d %d %d %d", pcm_buf[0], pcm_buf[1], pcm_buf[2], pcm_buf[3], pcm_buf[4]);
 
-            if (err != ESP_OK || bytes_read != pcm_buf_size) {
+            if (err != ESP_OK || bytes_read != raw_buf_size) {
                 ESP_LOGW(TAG, "I2S Read Error or Timeout: %d, bytes: %d", err, bytes_read);
                 vTaskDelay(pdMS_TO_TICKS(50));
                 continue;
@@ -437,6 +445,18 @@ void audio_send_task(void *arg) {
 
             #if USE_OPUS_CODEC
                 int encoded_len = opus_encode(opus_encoder, pcm_buf, AUDIO_BLOCK_SIZE, send_buf + 3, OPUS_MAX_PACKET_SIZE);
+
+                // int decoded_samples = opus_decode(opus_decoder, send_buf + 3, encoded_len, pcm_buf, AUDIO_BLOCK_SIZE, 0);
+
+                //if (decoded_samples == AUDIO_BLOCK_SIZE) {
+                    // ESP_LOGI(TAG, "First 5 decoded samples: %d %d %d %d %d", pcm_buf[0], pcm_buf[1], pcm_buf[2], pcm_buf[3], pcm_buf[4]);
+
+                //    size_t bytes_written;
+                //    i2s_channel_write(tx_handle, pcm_buf, pcm_buf_size, &bytes_written, portMAX_DELAY);
+
+                //} else {
+                //    ESP_LOGW(TAG, "Wrong decoded bytes: %d", decoded_samples);
+                //}
             #else
                 int encoded_len = AUDIO_BLOCK_SIZE * sizeof(int16_t);
                 memcpy(send_buf + 3, pcm_buf, AUDIO_BLOCK_SIZE * sizeof(int16_t));
@@ -578,6 +598,8 @@ void audio_receive_task(void *arg) {
 void audio_mix_play_task(void *arg) {
     int32_t mix_buffer[AUDIO_BLOCK_SIZE];
     int16_t final_mix[AUDIO_BLOCK_SIZE];
+    int32_t i2s_out_buf[AUDIO_BLOCK_SIZE];
+
     size_t bytes_written;
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
@@ -618,14 +640,25 @@ void audio_mix_play_task(void *arg) {
                 if (mix_buffer[j] < INT16_MIN) mix_buffer[j] = INT16_MIN;
                 final_mix[j] = (int16_t)mix_buffer[j];
             }
-            i2s_channel_write(tx_handle, final_mix, sizeof(final_mix), &bytes_written, portMAX_DELAY);
-            if (bytes_written != sizeof(final_mix)) {
+
+            for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
+                // масштабирование и сдвиг в старшие 24 бита
+                // вариант 1: << 8 (просто добавить нули в младшие 8 бит)
+                i2s_out_buf[i] = ((int32_t)final_mix[i]) << 8;
+
+                // вариант 2: умножить на 256 (то же самое)
+                // i2s_out_buf[i] = (int32_t)final_mix[i] * 256;
+            }
+
+            i2s_channel_write(tx_handle, i2s_out_buf, sizeof(i2s_out_buf), &bytes_written, portMAX_DELAY);
+
+            if (bytes_written != sizeof(i2s_out_buf)) {
                 ESP_LOGW(TAG, "I2S Write Error or incomplete, bytes: %d", bytes_written);
             }
         } else {
             // Если активных клиентов не было, отправляем тишину
-            memset(final_mix, 0, sizeof(final_mix));
-            i2s_channel_write(tx_handle, final_mix, sizeof(final_mix), &bytes_written, pdMS_TO_TICKS(10));
+            memset(i2s_out_buf, 0, sizeof(i2s_out_buf));
+            i2s_channel_write(tx_handle, i2s_out_buf, sizeof(i2s_out_buf), &bytes_written, pdMS_TO_TICKS(10));
         }
     }
 }
@@ -766,7 +799,7 @@ void app_main(void) {
         init_udp_socket();
         if (udp_socket >= 0) {
             xTaskCreate(audio_receive_task, "audio_recv", 28672, NULL, 6, NULL);
-            xTaskCreate(audio_mix_play_task, "audio_mix", 4096, NULL, 7, NULL);
+            xTaskCreate(audio_mix_play_task, "audio_mix", 28672, NULL, 7, NULL);
             xTaskCreate(audio_send_task, "audio_send", 28672, NULL, 6, NULL);
             xTaskCreate(ping_task, "ping_task", 4096, NULL, 5, NULL);
         } else {
