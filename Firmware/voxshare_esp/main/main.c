@@ -277,7 +277,6 @@ void init_i2s() {
     ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
 }
 
-
 esp_err_t init_ethernet() {
     ESP_LOGI(TAG, "Initializing Ethernet...");
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
@@ -297,13 +296,13 @@ esp_err_t init_ethernet() {
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(ETH_SPI_HOST, &buscfg, 1)); //was SPI_DMA_CH_AUTO
+    ESP_ERROR_CHECK(spi_bus_initialize(ETH_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
     spi_device_interface_config_t devcfg = {
         .mode = 0,
         .clock_speed_hz = ETH_SPI_CLOCK_MHZ * 1000 * 1000,
         .spics_io_num = ETH_CS_GPIO,
-        .queue_size = 20
+        .queue_size = 20,  // можно увеличить до 50 при необходимости
     };
 
     eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(ETH_SPI_HOST, &devcfg);
@@ -312,25 +311,29 @@ esp_err_t init_ethernet() {
     esp_eth_mac_t *mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
     esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_config);
 
-    // Create MAC address for w5500
+    // Кастомный MAC-адрес
     uint8_t custom_mac[6];
-    esp_read_mac(custom_mac, ESP_MAC_WIFI_STA); //Read mac from WIFI
-    custom_mac[0] = 0x02;  // Set local address
-    custom_mac[5] += 1;    // Make it unique
-    ESP_ERROR_CHECK(mac->set_addr(mac, custom_mac)); 
+    esp_read_mac(custom_mac, ESP_MAC_WIFI_STA);
+    custom_mac[0] = 0x02;
+    custom_mac[5] += 1;
+    ESP_ERROR_CHECK(mac->set_addr(mac, custom_mac));
 
     esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
     esp_eth_handle_t eth_handle = NULL;
     ESP_ERROR_CHECK(esp_eth_driver_install(&eth_config, &eth_handle));
 
-    void* glue = esp_eth_new_netif_glue(eth_handle);
+    void *glue = esp_eth_new_netif_glue(eth_handle);
     ESP_ERROR_CHECK(esp_netif_attach(s_eth_netif, glue));
+
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL));
+
+    // Включаем прием только нужных пакетов (отключаем promiscuous)
+    mac->set_promiscuous(mac, false);
+
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));
 
     ESP_LOGI(TAG, "Initializing Ethernet done.");
-
     return ESP_OK;
 }
 
@@ -388,7 +391,7 @@ void audio_send_task(void *arg) {
     size_t pcm_buf_size = AUDIO_BLOCK_SIZE * sizeof(int16_t);
     int16_t *pcm_buf = heap_caps_malloc(pcm_buf_size, MALLOC_CAP_8BIT);    
 
-    size_t send_buf_size = OPUS_MAX_PACKET_SIZE + 3;
+    // size_t send_buf_size = OPUS_MAX_PACKET_SIZE + 3;
     uint8_t *send_buf = heap_caps_malloc(3 + OPUS_MAX_PACKET_SIZE, MALLOC_CAP_DEFAULT);
 
     ESP_LOGI(TAG, "Allocating buffers: RAW %p, PCM %p, SEND %p", raw_buf, pcm_buf, send_buf);
@@ -592,8 +595,6 @@ void audio_receive_task(void *arg) {
     free(rx_buf);
     free(decoded_pcm);
 }
-
-
 
 void audio_mix_play_task(void *arg) {
     int32_t mix_buffer[AUDIO_BLOCK_SIZE];
