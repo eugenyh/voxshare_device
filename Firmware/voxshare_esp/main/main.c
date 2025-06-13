@@ -1,4 +1,4 @@
-// Ver 0.1FIX
+// Ver 0.2FIX
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
@@ -46,33 +46,41 @@ static OpusEncoder *opus_encoder = NULL;
 static OpusDecoder *opus_decoder = NULL;
 
 // --- Configuration ---
-#define SAMPLE_RATE 16000
+#define PACKET_TYPE_PING      "PING"
+#define PACKET_TYPE_PING_LEN  4
+#define PACKET_TYPE_AUDIO     "AUD"
+#define PACKET_TYPE_AUDIO_LEN 3
+#define PING_INTERVAL_MS      2000 // 2 секунды как в Python
+
+#define SAMPLE_RATE      16000
 #define AUDIO_BLOCK_SIZE 320
-#define MAX_CLIENTS 16
-#define MIX_INTERVAL_MS 20
-#define CLIENT_TIMEOUT_INTERVALS 5
+#define MAX_CLIENTS      16
+#define MIX_INTERVAL_MS  20
+
+#define CLIENT_TIMEOUT_MS 5000
+#define CLIENT_NICK_SIZE  32
 
 #define MULTICAST_ADDR "239.255.42.99"
 #define MULTICAST_PORT 5005
 
 #define I2S_NUM I2S_NUM_0
 #define I2S_DMA_BUF_LEN 1024
-#define I2S_BCK_IO 26
-#define I2S_WS_IO 25
+#define I2S_BCK_IO      26
+#define I2S_WS_IO       25
 #define I2S_DATA_OUT_IO 22
-#define I2S_DATA_IN_IO 19
+#define I2S_DATA_IN_IO  19
 
 #define BUTTON_GPIO GPIO_NUM_0
-#define LED_GPIO GPIO_NUM_2
+#define LED_GPIO    GPIO_NUM_2
 
 // W5500 SPI Configuration
 #define ETH_SPI_HOST SPI2_HOST
 #define ETH_SPI_SCLK_GPIO 14
 #define ETH_SPI_MISO_GPIO 12
 #define ETH_SPI_MOSI_GPIO 13
-#define ETH_CS_GPIO 5
-#define ETH_INT_GPIO 4
-#define ETH_RST_GPIO 16
+#define ETH_CS_GPIO       5
+#define ETH_INT_GPIO      4
+#define ETH_RST_GPIO      16
 #define ETH_SPI_CLOCK_MHZ 4 
 
 // W5500 PHY Configuration
@@ -91,6 +99,7 @@ typedef struct {
     int16_t buffer[AUDIO_BLOCK_SIZE];
     bool has_audio;
     int64_t last_seen;
+    char nickname[CLIENT_NICK_SIZE];
 } client_audio_t;
 
 static client_audio_t clients[MAX_CLIENTS] = {0};
@@ -100,7 +109,8 @@ static EventGroupHandle_t network_event_group;
 const int GOT_IP_BIT = BIT0;
 
 // --- Function Prototypes ---
-void add_or_update_client(uint32_t ip, int16_t *audio_data);
+void ping_task(void *arg);
+void add_or_update_client(uint32_t ip, int16_t *audio_data, const char* nickname);
 void clear_inactive_clients();
 void init_gpio();
 void init_i2s();
@@ -112,42 +122,106 @@ void audio_mix_play_task(void *arg);
 static void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 
+// --- Ping sending ---
+void ping_task(void *arg) {
+    uint8_t ping_packet[128] = {0};
+    const char *device_nick = "ESP32_Device"; // Или конфигурируемое имя
+    
+    while (1) {
+        // Формируем ping-пакет (4 байта тип + ник)
+        memcpy(ping_packet, PACKET_TYPE_PING, PACKET_TYPE_PING_LEN);
+        strncpy((char*)ping_packet + PACKET_TYPE_PING_LEN, 
+               device_nick, 
+               sizeof(ping_packet) - PACKET_TYPE_PING_LEN - 1);
+        
+        size_t ping_len = PACKET_TYPE_PING_LEN + strlen(device_nick);
+        
+        // Логирование для отладки
+        ESP_LOGD(TAG, "Sending PING (%d bytes): type=%.4s, nick=%s", 
+                ping_len, ping_packet, ping_packet + PACKET_TYPE_PING_LEN);
+        
+        sendto(udp_socket, ping_packet, ping_len, 0, 
+              (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
+        
+        vTaskDelay(pdMS_TO_TICKS(PING_INTERVAL_MS));
+    }
+}
+
 // --- Client Management ---
-void add_or_update_client(uint32_t ip, int16_t *audio_data) {
+void add_or_update_client(uint32_t ip, int16_t *audio_data, const char* nickname) {
     int first_empty = -1;
+    char clean_nick[CLIENT_NICK_SIZE] = {0};
+    
+    // 1. Обработка nickname (улучшенная версия)
+    if (nickname != NULL && nickname[0] != '\0') {  // Проверка на NULL и пустую строку
+        strncpy(clean_nick, nickname, sizeof(clean_nick)-1);
+        clean_nick[sizeof(clean_nick)-1] = '\0';
+        
+        // Дополнительная очистка от непечатных символов
+        for (char *p = clean_nick; *p; p++) {
+            if ((uint8_t)*p < 32 || (uint8_t)*p > 127) {
+                *p = '_';
+            }
+        }
+    } else {
+        strncpy(clean_nick, "Unknown", sizeof(clean_nick)-1);
+    }
+
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].ip_addr == ip) {
-            memcpy(clients[i].buffer, audio_data, sizeof(int16_t) * AUDIO_BLOCK_SIZE);
-            clients[i].has_audio = true;
+            // Обновление существующего клиента
+            if (audio_data) {
+                memcpy(clients[i].buffer, audio_data, sizeof(int16_t) * AUDIO_BLOCK_SIZE);
+                clients[i].has_audio = true;
+            }
+
+            // Всегда обновляем nickname, если он предоставлен
+            strncpy(clients[i].nickname, clean_nick, sizeof(clients[i].nickname)-1);
+            clients[i].nickname[sizeof(clients[i].nickname)-1] = '\0';
+
             clients[i].last_seen = esp_timer_get_time();
             return;
         }
+
         if (first_empty == -1 && clients[i].ip_addr == 0) {
             first_empty = i;
         }
     }
 
+    // Добавление нового клиента
     if (first_empty != -1) {
         clients[first_empty].ip_addr = ip;
-        memcpy(clients[first_empty].buffer, audio_data, sizeof(int16_t) * AUDIO_BLOCK_SIZE);
-        clients[first_empty].has_audio = true;
         clients[first_empty].last_seen = esp_timer_get_time();
-        ESP_LOGI(TAG, "New client added: %s", inet_ntoa(*(struct in_addr *)&ip));
+        
+        strncpy(clients[first_empty].nickname, clean_nick, sizeof(clients[first_empty].nickname)-1);
+        clients[first_empty].nickname[sizeof(clients[first_empty].nickname)-1] = '\0';
+        
+        if (audio_data) {
+            memcpy(clients[first_empty].buffer, audio_data, sizeof(int16_t) * AUDIO_BLOCK_SIZE);
+            clients[first_empty].has_audio = true;
+        } else {
+            memset(clients[first_empty].buffer, 0, sizeof(int16_t) * AUDIO_BLOCK_SIZE);
+            clients[first_empty].has_audio = false;
+        }
+        
+        ESP_LOGI(TAG, "New client added: %s (%s)", 
+                inet_ntoa(*(struct in_addr *)&ip),
+                clients[first_empty].nickname);
     } else {
-        ESP_LOGW(TAG, "Max clients reached, ignoring new client.");
+        ESP_LOGW(TAG, "Max clients reached, ignoring new client. IP: %s", 
+                inet_ntoa(*(struct in_addr *)&ip));
     }
 }
 
 void clear_inactive_clients() {
     int64_t now = esp_timer_get_time();
-    int64_t timeout = MIX_INTERVAL_MS * CLIENT_TIMEOUT_INTERVALS * 1000;
-
+    
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].ip_addr != 0 && (now - clients[i].last_seen > timeout)) {
-            ESP_LOGI(TAG, "Client timed out: %s", inet_ntoa(*(struct in_addr *)&clients[i].ip_addr));
-            clients[i].ip_addr = 0;
-            // Флаг теперь сбрасывается только для неактивных клиентов.
-            clients[i].has_audio = false;
+        if (clients[i].ip_addr != 0 && (now - clients[i].last_seen > CLIENT_TIMEOUT_MS * 1000)) {
+            ESP_LOGI(TAG, "Client timed out: %s (%s)", 
+                   inet_ntoa(*(struct in_addr *)&clients[i].ip_addr),
+                   clients[i].nickname);
+            memset(&clients[i], 0, sizeof(client_audio_t));
         }
     }
 }
@@ -430,13 +504,43 @@ void audio_receive_task(void *arg) {
     while (1) {
         int len = recvfrom(udp_socket, rx_buf, 3 + OPUS_MAX_PACKET_SIZE, 0,
                            (struct sockaddr *)&source_addr, &socklen);
+
         if (len < 0) {
             ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
-        if (len > 3 && rx_buf[0] == 'A' && rx_buf[1] == 'U' && rx_buf[2] == 'D') {
+        if (len >= PACKET_TYPE_PING_LEN && memcmp(rx_buf, PACKET_TYPE_PING, PACKET_TYPE_PING_LEN) == 0) {
+            char received_nick[32] = {0}; // Инициализация нулями
+            int nick_len = len - PACKET_TYPE_PING_LEN; // Длина данных после заголовка
+    
+            // Копируем только фактически полученные данные
+            if (nick_len > 0) {
+               int copy_len = (nick_len < sizeof(received_nick)-1) ? nick_len : sizeof(received_nick)-1;
+               memcpy(received_nick, rx_buf + PACKET_TYPE_PING_LEN, copy_len);
+               received_nick[copy_len] = '\0'; // Гарантированное завершение строки
+        
+               // Очистка от непечатных символов
+               for (char *p = received_nick; *p; p++) {
+                   if ((uint8_t)*p < 32 || (uint8_t)*p > 127) *p = '_';
+               }
+            } else {
+               strcpy(received_nick, "Unknown");
+            }
+    
+            // Логирование для отладки
+            ESP_LOGI(TAG, "Received PING from %s, nick: '%s' (len=%d)", 
+                     inet_ntoa(*(struct in_addr *)&source_addr.sin_addr.s_addr),
+                     received_nick,
+                     nick_len);
+    
+            if (xSemaphoreTake(clients_mutex, portMAX_DELAY) == pdTRUE) {
+               add_or_update_client(source_addr.sin_addr.s_addr, NULL, received_nick);
+               xSemaphoreGive(clients_mutex);
+            }
+        }
+        else if (len > 3 && memcmp(rx_buf, PACKET_TYPE_AUDIO, 3) == 0) {
 
             #if USE_OPUS_CODEC
                 int decoded_samples = opus_decode(opus_decoder, rx_buf + 3, len - 3, decoded_pcm, AUDIO_BLOCK_SIZE, 0);
@@ -454,7 +558,7 @@ void audio_receive_task(void *arg) {
                 // Игнорируем собственные пакеты, если передача активна
                 if (!is_transmitting && sender_ip != local_ip_addr) {
                     if (xSemaphoreTake(clients_mutex, portMAX_DELAY) == pdTRUE) {
-                        add_or_update_client(sender_ip, decoded_pcm);
+                        add_or_update_client(sender_ip, decoded_pcm, NULL);
                         xSemaphoreGive(clients_mutex);
                     }
                 }
@@ -462,6 +566,7 @@ void audio_receive_task(void *arg) {
                 ESP_LOGE(TAG, "Opus decode failed: %d", decoded_samples);
             }
         }
+
     }
 
     free(rx_buf);
@@ -663,6 +768,7 @@ void app_main(void) {
             xTaskCreate(audio_receive_task, "audio_recv", 28672, NULL, 6, NULL);
             xTaskCreate(audio_mix_play_task, "audio_mix", 4096, NULL, 7, NULL);
             xTaskCreate(audio_send_task, "audio_send", 28672, NULL, 6, NULL);
+            xTaskCreate(ping_task, "ping_task", 4096, NULL, 5, NULL);
         } else {
             ESP_LOGE(TAG, "UDP socket failed to initialize. Cannot start tasks.");
         }
