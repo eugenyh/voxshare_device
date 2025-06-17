@@ -32,6 +32,7 @@
 #include "math.h"
 
 #define TAG "VOXSHARE"
+
 #define SINUS_SEND_TO_I2S     0
 
 // --- Configuration ---
@@ -78,12 +79,16 @@ static OpusDecoder *opus_decoder = NULL;
 #define ETH_CS_GPIO       5
 #define ETH_INT_GPIO      4
 #define ETH_RST_GPIO      16
-#define ETH_SPI_CLOCK_MHZ 20 
+#define ETH_SPI_CLOCK_MHZ 20 // Снижено с 40 до 10 для повышения стабильности SPI
 
 // W5500 PHY Configuration
 #define ETH_PHY_ADDR 1
 
+#define DEVICE_PREFIX "ESP32_VSD_"
+
 // --- Global Variables ---
+static char device_nick[32];
+
 static int udp_socket;
 static struct sockaddr_in mcast_addr;
 static volatile bool is_transmitting = false;
@@ -135,7 +140,7 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t
 // --- Ping sending ---
 void ping_task(void *arg) {
     uint8_t ping_packet[128] = {0};
-    const char *device_nick = "ESP32_Device"; // Или конфигурируемое имя
+    // const char *device_nick = "ESP32_Device"; // Или конфигурируемое имя
     
     while (1) {
         // Формируем ping-пакет (4 байта тип + ник)
@@ -363,6 +368,9 @@ esp_err_t init_ethernet() {
     custom_mac[0] = 0x02;
     custom_mac[5] += 1;
     ESP_ERROR_CHECK(mac->set_addr(mac, custom_mac));
+    // Define device_nick based on device prexix + last 2 MAC bytes 
+    snprintf(device_nick, sizeof(device_nick), DEVICE_PREFIX "%02X%02X", custom_mac[4], custom_mac[5]);
+
 
     esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
     s_eth_handle = NULL; // Обнуляем перед установкой
@@ -939,6 +947,8 @@ void start_network_tasks() {
     } else {
         ESP_LOGE(TAG, "UDP socket failed to initialize. Cannot start tasks.");
     }
+    // После успешного старта всех задач, отключаем "шумные" логи драйвера, чтобы избежать дедлока в будущем.
+    esp_log_level_set("w5500.mac", ESP_LOG_NONE);
 }
 
 void network_supervisor_task(void *arg) {
