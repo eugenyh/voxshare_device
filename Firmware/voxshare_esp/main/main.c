@@ -372,6 +372,7 @@ esp_err_t init_ethernet() {
     // Define device_nick based on device prexix + last 2 MAC bytes 
     snprintf(device_nick, sizeof(device_nick), DEVICE_PREFIX "%02X%02X", custom_mac[4], custom_mac[5]);
 
+    ESP_LOGI(TAG, "Generated device nickname: %s", device_nick);
 
     esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
     s_eth_handle = NULL; // Обнуляем перед установкой
