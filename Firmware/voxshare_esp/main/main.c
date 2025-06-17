@@ -95,7 +95,8 @@ static volatile bool is_transmitting = false;
 static i2s_chan_handle_t tx_handle;
 static i2s_chan_handle_t rx_handle;
 static esp_netif_t *s_eth_netif = NULL;
-static esp_eth_handle_t s_eth_handle = NULL; // Глобальный хэндл для Ethernet
+static esp_eth_handle_t s_eth_handle = NULL;
+static esp_eth_netif_glue_handle_t s_eth_glue = NULL;
 static volatile bool eth_reinitalizing = false;
 
 // Хэндлы задач для их перезапуска
@@ -338,7 +339,7 @@ esp_err_t init_ethernet() {
     phy_config.phy_addr = ETH_PHY_ADDR;
     phy_config.reset_gpio_num = ETH_RST_GPIO;
 
-    gpio_install_isr_service(0);
+    // gpio_install_isr_service(0); // Перемещено в app_main, чтобы не вызываться повторно
 
     spi_bus_config_t buscfg = {
         .miso_io_num = ETH_SPI_MISO_GPIO,
@@ -376,8 +377,8 @@ esp_err_t init_ethernet() {
     s_eth_handle = NULL; // Обнуляем перед установкой
     ESP_ERROR_CHECK(esp_eth_driver_install(&eth_config, &s_eth_handle));
 
-    void *glue = esp_eth_new_netif_glue(s_eth_handle);
-    ESP_ERROR_CHECK(esp_netif_attach(s_eth_netif, glue));
+    s_eth_glue = esp_eth_new_netif_glue(s_eth_handle);
+    ESP_ERROR_CHECK(esp_netif_attach(s_eth_netif, s_eth_glue));
 
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL));
@@ -757,24 +758,31 @@ void network_stack_reinit() {
         udp_socket = -1;
     }
 
-    // 3. Останавливаем и удаляем Ethernet драйвер
+    // 3. Правильная последовательность деинициализации
     if (s_eth_handle) {
         ESP_LOGI(TAG, "Stopping Ethernet...");
         esp_eth_stop(s_eth_handle);
-        // esp_netif_detach не нужен, esp_eth_driver_uninstall сделает это
-        ESP_LOGI(TAG, "Uninstalling Ethernet driver...");
+        if (s_eth_glue) {
+            esp_eth_del_netif_glue(s_eth_glue);
+            s_eth_glue = NULL;
+        }
         esp_eth_driver_uninstall(s_eth_handle);
         s_eth_handle = NULL;
+    }
+    // Освобождаем шину SPI после того, как драйвер ее отпустил
+    ESP_LOGI(TAG, "Freeing SPI bus...");
+    spi_bus_free(ETH_SPI_HOST);
+
+    if (s_eth_netif) {
+        esp_netif_destroy(s_eth_netif);
+        s_eth_netif = NULL;
     }
     
     vTaskDelay(pdMS_TO_TICKS(500)); // Даем время на завершение
 
-    // 4. Повторная инициализация Ethernet
+    // 4. Повторная инициализация
     ESP_LOGI(TAG, "Re-initializing Ethernet hardware...");
-    if (init_ethernet() != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to re-initialize ethernet! Restarting...");
-        esp_restart();
-    }
+    ESP_ERROR_CHECK(init_ethernet());
 
     // 5. Ждем нового IP
     ESP_LOGI(TAG, "Waiting for new IP address...");
@@ -889,6 +897,8 @@ void app_main(void) {
     }
 
     init_gpio();
+    // Устанавливаем службу ISR один раз при старте
+    gpio_install_isr_service(0);
 
     init_i2s();
 
