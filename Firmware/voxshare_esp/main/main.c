@@ -26,6 +26,7 @@
 #include "esp_mac.h"
 #include "w5500.h"
 #include "opus.h"
+#include "esp_dsp.h"
 
 // --- For beep sample generation ---
 #include "math.h"
@@ -77,7 +78,7 @@ static OpusDecoder *opus_decoder = NULL;
 #define ETH_CS_GPIO       5
 #define ETH_INT_GPIO      4
 #define ETH_RST_GPIO      16
-#define ETH_SPI_CLOCK_MHZ 4 
+#define ETH_SPI_CLOCK_MHZ 20 
 
 // W5500 PHY Configuration
 #define ETH_PHY_ADDR 1
@@ -89,6 +90,16 @@ static volatile bool is_transmitting = false;
 static i2s_chan_handle_t tx_handle;
 static i2s_chan_handle_t rx_handle;
 static esp_netif_t *s_eth_netif = NULL;
+static esp_eth_handle_t s_eth_handle = NULL; // Глобальный хэндл для Ethernet
+static volatile bool eth_reinitalizing = false;
+
+// Хэндлы задач для их перезапуска
+static TaskHandle_t audio_receive_task_handle = NULL;
+static TaskHandle_t audio_mix_play_task_handle = NULL;
+static TaskHandle_t audio_send_task_handle = NULL;
+static TaskHandle_t ping_task_handle = NULL;
+
+void start_network_tasks(); // Прототип новой функции
 
 typedef struct {
     uint32_t ip_addr;
@@ -103,6 +114,7 @@ static SemaphoreHandle_t clients_mutex;
 
 static EventGroupHandle_t network_event_group;
 const int GOT_IP_BIT = BIT0;
+const int REINIT_BIT = BIT1; // Новый бит для сигнала о перезапуске
 
 // --- Function Prototypes ---
 void ping_task(void *arg);
@@ -115,6 +127,8 @@ void init_udp_socket();
 void audio_send_task(void *arg);
 void audio_receive_task(void *arg);
 void audio_mix_play_task(void *arg);
+void network_stack_reinit();
+void network_supervisor_task(void *arg);
 static void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 
@@ -136,9 +150,26 @@ void ping_task(void *arg) {
         ESP_LOGD(TAG, "Sending PING (%d bytes): type=%.4s, nick=%s", 
                 ping_len, ping_packet, ping_packet + PACKET_TYPE_PING_LEN);
         
-        sendto(udp_socket, ping_packet, ping_len, 0, 
-              (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
-        
+        int sent = sendto(udp_socket, ping_packet, ping_len, 0,
+                          (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
+
+        // Точно такая же логика отслеживания ошибок, как в audio_send_task
+        static int tx_fail_count = 0;
+        const int TX_FAIL_THRESHOLD = 10;
+
+        if (sent < 0) {
+            ESP_LOGW(TAG, "Ping sendto failed: errno=%d", errno);
+            tx_fail_count++;
+            if (tx_fail_count > TX_FAIL_THRESHOLD && !eth_reinitalizing) {
+                ESP_LOGE(TAG, "Too many TX errors in PING task, signaling for network stack re-init...");
+                xEventGroupSetBits(network_event_group, REINIT_BIT);
+                tx_fail_count = 0;
+                vTaskDelay(pdMS_TO_TICKS(5000)); // Пауза, чтобы супервизор успел сработать
+            }
+        } else {
+            tx_fail_count = 0;
+        }
+
         vTaskDelay(pdMS_TO_TICKS(PING_INTERVAL_MS));
     }
 }
@@ -211,14 +242,29 @@ void add_or_update_client(uint32_t ip, int16_t *audio_data, const char* nickname
 
 void clear_inactive_clients() {
     int64_t now = esp_timer_get_time();
-    
+    uint32_t timed_out_ips[MAX_CLIENTS] = {0};
+    char timed_out_nicks[MAX_CLIENTS][CLIENT_NICK_SIZE] = {0};
+    int timed_out_count = 0;
+
+    // --- Эта часть остается под мьютексом ---
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].ip_addr != 0 && (now - clients[i].last_seen > CLIENT_TIMEOUT_MS * 1000)) {
-            ESP_LOGI(TAG, "Client timed out: %s (%s)", 
-                   inet_ntoa(*(struct in_addr *)&clients[i].ip_addr),
-                   clients[i].nickname);
+            if (timed_out_count < MAX_CLIENTS) {
+                timed_out_ips[timed_out_count] = clients[i].ip_addr;
+                strncpy(timed_out_nicks[timed_out_count], clients[i].nickname, CLIENT_NICK_SIZE -1);
+                timed_out_nicks[timed_out_count][CLIENT_NICK_SIZE - 1] = '\0';
+                timed_out_count++;
+            }
             memset(&clients[i], 0, sizeof(client_audio_t));
         }
+    }
+    // --- Мьютекс будет освобожден после этого в вызывающей функции ---
+
+    // --- Эта часть теперь ВНЕ мьютекса ---
+    for (int i = 0; i < timed_out_count; i++) {
+        ESP_LOGI(TAG, "Client timed out: %s (%s)",
+               inet_ntoa(*(struct in_addr *)&timed_out_ips[i]),
+               timed_out_nicks[i]);
     }
 }
 
@@ -302,7 +348,7 @@ esp_err_t init_ethernet() {
         .mode = 0,
         .clock_speed_hz = ETH_SPI_CLOCK_MHZ * 1000 * 1000,
         .spics_io_num = ETH_CS_GPIO,
-        .queue_size = 50,  // можно увеличить до 50 при необходимости
+        .queue_size = 64,  // Увеличено для большей надежности
     };
 
     eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(ETH_SPI_HOST, &devcfg);
@@ -319,10 +365,10 @@ esp_err_t init_ethernet() {
     ESP_ERROR_CHECK(mac->set_addr(mac, custom_mac));
 
     esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
-    esp_eth_handle_t eth_handle = NULL;
-    ESP_ERROR_CHECK(esp_eth_driver_install(&eth_config, &eth_handle));
+    s_eth_handle = NULL; // Обнуляем перед установкой
+    ESP_ERROR_CHECK(esp_eth_driver_install(&eth_config, &s_eth_handle));
 
-    void *glue = esp_eth_new_netif_glue(eth_handle);
+    void *glue = esp_eth_new_netif_glue(s_eth_handle);
     ESP_ERROR_CHECK(esp_netif_attach(s_eth_netif, glue));
 
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
@@ -331,7 +377,7 @@ esp_err_t init_ethernet() {
     // Включаем прием только нужных пакетов (отключаем promiscuous)
     mac->set_promiscuous(mac, false);
 
-    ESP_ERROR_CHECK(esp_eth_start(eth_handle));
+    ESP_ERROR_CHECK(esp_eth_start(s_eth_handle));
 
     ESP_LOGI(TAG, "Initializing Ethernet done.");
     return ESP_OK;
@@ -406,6 +452,9 @@ void audio_send_task(void *arg) {
 
     ESP_LOGI(TAG, "Allocating buffers: RAW %p, PCM %p, SEND %p", raw_buf, pcm_buf, send_buf);
 
+    int tx_fail_count = 0;
+    const int TX_FAIL_THRESHOLD = 10; // Порог ошибок для перезапуска
+
     ESP_LOGI(TAG, "Audio Send Task Started");
 
     if (!pcm_buf || !send_buf) {
@@ -476,7 +525,16 @@ void audio_send_task(void *arg) {
 
             if (sent < 0) {
                 ESP_LOGW(TAG, "UDP sendto failed: errno=%d", errno);
+                tx_fail_count++;
+                if (tx_fail_count > TX_FAIL_THRESHOLD && !eth_reinitalizing) {
+                    ESP_LOGE(TAG, "Too many TX errors in AUDIO task, signaling for network stack re-init...");
+                    xEventGroupSetBits(network_event_group, REINIT_BIT);
+                    tx_fail_count = 0;
+                    vTaskDelay(pdMS_TO_TICKS(5000)); // Пауза, чтобы супервизор успел сработать
+                }
                 vTaskDelay(pdMS_TO_TICKS(50));
+            } else {
+                tx_fail_count = 0; // Сбрасываем счетчик при успешной отправке
             }
 
         } else {
@@ -523,8 +581,12 @@ void audio_receive_task(void *arg) {
     }
 
     while (1) {
+        int64_t recv_start_time = esp_timer_get_time();
         int len = recvfrom(udp_socket, rx_buf, 3 + OPUS_MAX_PACKET_SIZE, 0,
                            (struct sockaddr *)&source_addr, &socklen);
+        int64_t recv_end_time = esp_timer_get_time();
+
+        ESP_LOGD(TAG, "recvfrom took %lld us", recv_end_time - recv_start_time);
 
         if (len < 0) {
             ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
@@ -556,9 +618,14 @@ void audio_receive_task(void *arg) {
                      received_nick,
                      nick_len);
     
-            if (xSemaphoreTake(clients_mutex, portMAX_DELAY) == pdTRUE) {
+            int64_t mutex_start_time = esp_timer_get_time();
+            if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+               int64_t mutex_end_time = esp_timer_get_time();
+               ESP_LOGD(TAG, "Mutex wait time (PING): %lld us", mutex_end_time - mutex_start_time);
                add_or_update_client(source_addr.sin_addr.s_addr, NULL, received_nick);
                xSemaphoreGive(clients_mutex);
+            } else {
+                ESP_LOGW(TAG, "Failed to take mutex for PING");
             }
         }
         else if (len > 3 && memcmp(rx_buf, PACKET_TYPE_AUDIO, 3) == 0) {
@@ -578,9 +645,14 @@ void audio_receive_task(void *arg) {
 
                 // Игнорируем собственные пакеты, если передача активна
                 if (!is_transmitting && sender_ip != local_ip_addr) {
-                    if (xSemaphoreTake(clients_mutex, portMAX_DELAY) == pdTRUE) {
+                    int64_t mutex_start_time = esp_timer_get_time();
+                    if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                        int64_t mutex_end_time = esp_timer_get_time();
+                        ESP_LOGD(TAG, "Mutex wait time (AUDIO): %lld us", mutex_end_time - mutex_start_time);
                         add_or_update_client(sender_ip, decoded_pcm, NULL);
                         xSemaphoreGive(clients_mutex);
+                    } else {
+                        ESP_LOGW(TAG, "Failed to take mutex for AUDIO");
                     }
                 }
             } else {
@@ -595,71 +667,123 @@ void audio_receive_task(void *arg) {
 }
 
 void audio_mix_play_task(void *arg) {
-    int32_t mix_buffer[AUDIO_BLOCK_SIZE];
-    int16_t final_mix[AUDIO_BLOCK_SIZE];
-    int32_t i2s_out_buf[AUDIO_BLOCK_SIZE];
+    static int16_t mix_buffer[AUDIO_BLOCK_SIZE] = {0};
+    static int16_t scaled_buffer[AUDIO_BLOCK_SIZE] = {0};
+    static int32_t i2s_out_buf[AUDIO_BLOCK_SIZE] = {0};
+    const size_t i2s_buf_size_bytes = sizeof(i2s_out_buf);
 
-    size_t bytes_written;
+    const int max_shift = 2;  // Максимальное усиление (2^2 = x4)
     TickType_t xLastWakeTime = xTaskGetTickCount();
-
     ESP_LOGI(TAG, "Audio Mix/Play Task Started");
 
     while (1) {
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(MIX_INTERVAL_MS));
-        if (is_transmitting) {
-            continue;
-        }
+        if (is_transmitting) continue;
 
         memset(mix_buffer, 0, sizeof(mix_buffer));
         int active_clients = 0;
-        if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            // Сначала удаляем "протухших" клиентов
-            clear_inactive_clients(); 
 
-            // Затем микшируем аудио от тех, кто прислал данные
+        if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            clear_inactive_clients();
             for (int i = 0; i < MAX_CLIENTS; i++) {
                 if (clients[i].ip_addr != 0 && clients[i].has_audio) {
                     active_clients++;
-                    for (int j = 0; j < AUDIO_BLOCK_SIZE; j++) {
-                        mix_buffer[j] += clients[i].buffer[j];
-                    }
-                    // Сбрасываем флаг ПОСЛЕ того, как данные были использованы
+                    dsps_add_s16(clients[i].buffer, mix_buffer, mix_buffer, AUDIO_BLOCK_SIZE, 1, 1, 1, 0);
                     clients[i].has_audio = false;
                 }
             }
             xSemaphoreGive(clients_mutex);
         } else {
-            ESP_LOGW(TAG, "Failed to get mutex in mix task!");
+            ESP_LOGW(TAG, "Mutex timeout in audio task!");
             continue;
         }
 
-        if (active_clients > 0) {
-            for (int j = 0; j < AUDIO_BLOCK_SIZE; j++) {
-                if (mix_buffer[j] > INT16_MAX) mix_buffer[j] = INT16_MAX;
-                if (mix_buffer[j] < INT16_MIN) mix_buffer[j] = INT16_MIN;
-                final_mix[j] = (int16_t)mix_buffer[j];
-            }
+        int shift = (active_clients == 0) ? 0 : max_shift - __builtin_clz(active_clients | 1);
+        shift = (shift < 0) ? 0 : (shift > max_shift) ? max_shift : shift;
 
-            for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
-                // масштабирование и сдвиг в старшие 24 бита
-                // вариант 1: << 8 (просто добавить нули в младшие 8 бит)
-                i2s_out_buf[i] = ((int32_t)final_mix[i]) << 8;
+        // Масштабирование и усиление через esp-dsp
+        int16_t unity[AUDIO_BLOCK_SIZE];
+        for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) unity[i] = 1;
 
-                // вариант 2: умножить на 256 (то же самое)
-                // i2s_out_buf[i] = (int32_t)final_mix[i] * 256;
-            }
+        dsps_mul_s16(mix_buffer, unity, scaled_buffer, AUDIO_BLOCK_SIZE, 1, 1, 1, shift);
 
-            i2s_channel_write(tx_handle, i2s_out_buf, sizeof(i2s_out_buf), &bytes_written, portMAX_DELAY);
 
-            if (bytes_written != sizeof(i2s_out_buf)) {
-                ESP_LOGW(TAG, "I2S Write Error or incomplete, bytes: %d", bytes_written);
-            }
-        } else {
-            // Если активных клиентов не было, отправляем тишину
-            memset(i2s_out_buf, 0, sizeof(i2s_out_buf));
-            i2s_channel_write(tx_handle, i2s_out_buf, sizeof(i2s_out_buf), &bytes_written, pdMS_TO_TICKS(10));
+        for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
+             int32_t s = scaled_buffer[i];
+             if (s > INT16_MAX) s = INT16_MAX;
+             if (s < INT16_MIN) s = INT16_MIN;
+             i2s_out_buf[i] = s << 8;  // 24-бит для I2S
+        }
+
+        size_t bytes_written;
+        esp_err_t err = i2s_channel_write(tx_handle, i2s_out_buf, i2s_buf_size_bytes, &bytes_written, portMAX_DELAY);
+        if (err != ESP_OK || bytes_written != i2s_buf_size_bytes) {
+            ESP_LOGE(TAG, "I2S error: %d, written: %zu", err, bytes_written);
         }
     }
+}
+
+void network_stack_reinit() {
+    if (eth_reinitalizing) {
+        return;
+    }
+    eth_reinitalizing = true;
+    ESP_LOGE(TAG, "--- Starting Network Stack Re-initialization ---");
+
+    // 1. Удаляем задачи
+    ESP_LOGI(TAG, "Deleting network tasks...");
+    if (audio_receive_task_handle) vTaskDelete(audio_receive_task_handle);
+    if (audio_mix_play_task_handle) vTaskDelete(audio_mix_play_task_handle);
+    if (audio_send_task_handle) vTaskDelete(audio_send_task_handle);
+    if (ping_task_handle) vTaskDelete(ping_task_handle);
+    audio_receive_task_handle = NULL;
+    audio_mix_play_task_handle = NULL;
+    audio_send_task_handle = NULL;
+    ping_task_handle = NULL;
+
+
+    // 2. Закрываем сокет
+    if (udp_socket >= 0) {
+        ESP_LOGI(TAG, "Closing UDP socket...");
+        close(udp_socket);
+        udp_socket = -1;
+    }
+
+    // 3. Останавливаем и удаляем Ethernet драйвер
+    if (s_eth_handle) {
+        ESP_LOGI(TAG, "Stopping Ethernet...");
+        esp_eth_stop(s_eth_handle);
+        // esp_netif_detach не нужен, esp_eth_driver_uninstall сделает это
+        ESP_LOGI(TAG, "Uninstalling Ethernet driver...");
+        esp_eth_driver_uninstall(s_eth_handle);
+        s_eth_handle = NULL;
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(500)); // Даем время на завершение
+
+    // 4. Повторная инициализация Ethernet
+    ESP_LOGI(TAG, "Re-initializing Ethernet hardware...");
+    if (init_ethernet() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to re-initialize ethernet! Restarting...");
+        esp_restart();
+    }
+
+    // 5. Ждем нового IP
+    ESP_LOGI(TAG, "Waiting for new IP address...");
+    xEventGroupClearBits(network_event_group, GOT_IP_BIT); // Очищаем старый флаг
+    EventBits_t bits = xEventGroupWaitBits(network_event_group, GOT_IP_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(30000)); // Ждем 30 сек
+    
+    // 6. Пересоздаем задачи
+    if (bits & GOT_IP_BIT) {
+        ESP_LOGI(TAG, "Got new IP. Restarting network tasks...");
+        start_network_tasks();
+    } else {
+        ESP_LOGE(TAG, "Failed to get new IP address. Restarting...");
+        esp_restart();
+    }
+
+    ESP_LOGI(TAG, "--- Network Stack Re-initialization Finished ---");
+    eth_reinitalizing = false;
 }
 
 // --- Event Handlers ---
@@ -794,19 +918,34 @@ void app_main(void) {
     EventBits_t bits = xEventGroupWaitBits(network_event_group, GOT_IP_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
 
     if (bits & GOT_IP_BIT) {
-        ESP_LOGI(TAG, "Got IP address. Initializing UDP...");
-        init_udp_socket();
-        if (udp_socket >= 0) {
-            xTaskCreate(audio_receive_task, "audio_recv", 28672, NULL, 6, NULL);
-            xTaskCreate(audio_mix_play_task, "audio_mix", 28672, NULL, 7, NULL);
-            xTaskCreate(audio_send_task, "audio_send", 28672, NULL, 6, NULL);
-            xTaskCreate(ping_task, "ping_task", 4096, NULL, 5, NULL);
-        } else {
-            ESP_LOGE(TAG, "UDP socket failed to initialize. Cannot start tasks.");
-        }
+        start_network_tasks();
     } else {
         ESP_LOGE(TAG, "Failed to get IP address. Halting.");
     }
 
     ESP_LOGI(TAG, "app_main finished setup.");
+}
+
+void start_network_tasks() {
+    ESP_LOGI(TAG, "Initializing UDP and starting network tasks...");
+    init_udp_socket();
+    if (udp_socket >= 0) {
+        xTaskCreate(audio_receive_task, "audio_recv", 28672, NULL, 6, &audio_receive_task_handle);
+        xTaskCreate(audio_mix_play_task, "audio_mix", 28672, NULL, 7, &audio_mix_play_task_handle);
+        xTaskCreate(audio_send_task, "audio_send", 28672, NULL, 6, &audio_send_task_handle);
+        xTaskCreate(ping_task, "ping_task", 4096, NULL, 5, &ping_task_handle);
+        xTaskCreate(network_supervisor_task, "net_supervisor", 4096, NULL, 10, NULL); // Создаем супервизора
+        ESP_LOGI(TAG, "Network tasks started.");
+    } else {
+        ESP_LOGE(TAG, "UDP socket failed to initialize. Cannot start tasks.");
+    }
+}
+
+void network_supervisor_task(void *arg) {
+    while(1) {
+        EventBits_t bits = xEventGroupWaitBits(network_event_group, REINIT_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
+        if ((bits & REINIT_BIT) != 0) {
+            network_stack_reinit();
+        }
+    }
 }

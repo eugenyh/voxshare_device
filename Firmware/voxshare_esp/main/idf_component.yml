@@ -15,3 +15,4 @@ dependencies:
   #   # All dependencies of `main` are public by default.
   #   public: true
   78/esp-opus: ^1.0.5
+  espressif/esp-dsp: '*'
