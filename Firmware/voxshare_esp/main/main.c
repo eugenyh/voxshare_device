@@ -27,6 +27,8 @@
 #include "w5500.h"
 #include "opus.h"
 #include "esp_dsp.h"
+#include "dsps_biquad.h" // For Biquad Filter functions
+#include "dsps_biquad_gen.h" // For filter coefficient generation
 
 // --- For beep sample generation ---
 #include "math.h"
@@ -96,6 +98,8 @@ static i2s_chan_handle_t tx_handle;
 static i2s_chan_handle_t rx_handle;
 static esp_netif_t *s_eth_netif = NULL;
 static esp_eth_handle_t s_eth_handle = NULL;
+static esp_eth_mac_t *s_mac = NULL;
+static esp_eth_phy_t *s_phy = NULL;
 static esp_eth_netif_glue_handle_t s_eth_glue = NULL;
 static volatile bool eth_reinitalizing = false;
 
@@ -104,6 +108,12 @@ static TaskHandle_t audio_receive_task_handle = NULL;
 static TaskHandle_t audio_mix_play_task_handle = NULL;
 static TaskHandle_t audio_send_task_handle = NULL;
 static TaskHandle_t ping_task_handle = NULL;
+
+// --- DSP Filter Globals ---
+static float hpf_coeffs[5];
+static float lpf_coeffs[5];
+static float hpf_delay[2];
+static float lpf_delay[2];
 
 void start_network_tasks(); // Прототип новой функции
 
@@ -133,6 +143,7 @@ void init_udp_socket();
 void audio_send_task(void *arg);
 void audio_receive_task(void *arg);
 void audio_mix_play_task(void *arg);
+void init_filters();
 void network_stack_reinit();
 void network_supervisor_task(void *arg);
 static void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
@@ -143,25 +154,25 @@ void ping_task(void *arg) {
     uint8_t ping_packet[128] = {0};
     // const char *device_nick = "ESP32_Device"; // Или конфигурируемое имя
     
+    // Точно такая же логика отслеживания ошибок, как в audio_send_task
+    static int tx_fail_count = 0;
+    const int TX_FAIL_THRESHOLD = 10;
+    
     while (1) {
         // Формируем ping-пакет (4 байта тип + ник)
         memcpy(ping_packet, PACKET_TYPE_PING, PACKET_TYPE_PING_LEN);
-        strncpy((char*)ping_packet + PACKET_TYPE_PING_LEN, 
-               device_nick, 
+        strncpy((char*)ping_packet + PACKET_TYPE_PING_LEN,
+               device_nick,
                sizeof(ping_packet) - PACKET_TYPE_PING_LEN - 1);
         
         size_t ping_len = PACKET_TYPE_PING_LEN + strlen(device_nick);
         
         // Логирование для отладки
-        ESP_LOGD(TAG, "Sending PING (%d bytes): type=%.4s, nick=%s", 
+        ESP_LOGD(TAG, "Sending PING (%d bytes): type=%.4s, nick=%s",
                 ping_len, ping_packet, ping_packet + PACKET_TYPE_PING_LEN);
         
         int sent = sendto(udp_socket, ping_packet, ping_len, 0,
                           (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
-
-        // Точно такая же логика отслеживания ошибок, как в audio_send_task
-        static int tx_fail_count = 0;
-        const int TX_FAIL_THRESHOLD = 10;
 
         if (sent < 0) {
             ESP_LOGW(TAG, "Ping sendto failed: errno=%d", errno);
@@ -360,21 +371,21 @@ esp_err_t init_ethernet() {
     eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(ETH_SPI_HOST, &devcfg);
     w5500_config.int_gpio_num = ETH_INT_GPIO;
 
-    esp_eth_mac_t *mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
-    esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_config);
+    s_mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
+    s_phy = esp_eth_phy_new_w5500(&phy_config);
 
     // Кастомный MAC-адрес
     uint8_t custom_mac[6];
     esp_read_mac(custom_mac, ESP_MAC_WIFI_STA);
     custom_mac[0] = 0x02;
     custom_mac[5] += 1;
-    ESP_ERROR_CHECK(mac->set_addr(mac, custom_mac));
-    // Define device_nick based on device prexix + last 2 MAC bytes 
+    ESP_ERROR_CHECK(s_mac->set_addr(s_mac, custom_mac));
+    // Define device_nick based on device prexix + last 2 MAC bytes
     snprintf(device_nick, sizeof(device_nick), DEVICE_PREFIX "%02X%02X", custom_mac[4], custom_mac[5]);
 
     ESP_LOGI(TAG, "Generated device nickname: %s", device_nick);
 
-    esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
+    esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(s_mac, s_phy);
     s_eth_handle = NULL; // Обнуляем перед установкой
     ESP_ERROR_CHECK(esp_eth_driver_install(&eth_config, &s_eth_handle));
 
@@ -385,7 +396,7 @@ esp_err_t init_ethernet() {
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL));
 
     // Включаем прием только нужных пакетов (отключаем promiscuous)
-    mac->set_promiscuous(mac, false);
+    s_mac->set_promiscuous(s_mac, false);
 
     ESP_ERROR_CHECK(esp_eth_start(s_eth_handle));
 
@@ -447,9 +458,24 @@ void init_udp_socket() {
     ESP_LOGI(TAG, "UDP Socket Initialized for %s:%d", MULTICAST_ADDR, MULTICAST_PORT);
 }
 
+// --- Filter Initialization ---
+void init_filters() {
+    ESP_LOGI(TAG, "Initializing DSP filters...");
+    // High-pass filter to remove DC offset and low-frequency noise
+    dsps_biquad_gen_hpf_f32(hpf_coeffs, 100.0f, SAMPLE_RATE);
+    // Low-pass filter to remove high-frequency hiss
+    dsps_biquad_gen_lpf_f32(lpf_coeffs, 7000.0f, SAMPLE_RATE);
+
+    // Initialize delay lines to zero
+    memset(hpf_delay, 0, sizeof(hpf_delay));
+    memset(lpf_delay, 0, sizeof(lpf_delay));
+    ESP_LOGI(TAG, "DSP filters initialized.");
+}
+
 // --- Tasks ---
 void audio_send_task(void *arg) {
-    ESP_LOGI(TAG, "Free internal heap: %u", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "Audio Send Task Started");
+    ESP_LOGI(TAG, "Free MALLOC_CAP_8BIT: %u", heap_caps_get_free_size(MALLOC_CAP_8BIT));
  
     size_t raw_buf_size = AUDIO_BLOCK_SIZE * sizeof(uint32_t);
     uint32_t *raw_buf = heap_caps_malloc(raw_buf_size, MALLOC_CAP_8BIT);
@@ -457,20 +483,21 @@ void audio_send_task(void *arg) {
     size_t pcm_buf_size = AUDIO_BLOCK_SIZE * sizeof(int16_t);
     int16_t *pcm_buf = heap_caps_malloc(pcm_buf_size, MALLOC_CAP_8BIT);    
 
-    // size_t send_buf_size = OPUS_MAX_PACKET_SIZE + 3;
-    uint8_t *send_buf = heap_caps_malloc(3 + OPUS_MAX_PACKET_SIZE, MALLOC_CAP_DEFAULT);
+    uint8_t *send_buf = heap_caps_malloc(3 + OPUS_MAX_PACKET_SIZE, MALLOC_CAP_8BIT);
 
-    ESP_LOGI(TAG, "Allocating buffers: RAW %p, PCM %p, SEND %p", raw_buf, pcm_buf, send_buf);
+    if (!raw_buf || !pcm_buf || !send_buf) {
+        ESP_LOGE(TAG, "Failed to allocate audio buffers!");
+        if (raw_buf) free(raw_buf);
+        if (pcm_buf) free(pcm_buf);
+        if (send_buf) free(send_buf);
+        vTaskDelete(NULL);
+        return;
+    } else {
+        ESP_LOGI(TAG, "Allocating buffers: RAW %p, PCM %p, SEND %p", raw_buf, pcm_buf, send_buf);
+    }
 
     int tx_fail_count = 0;
     const int TX_FAIL_THRESHOLD = 10; // Порог ошибок для перезапуска
-
-    ESP_LOGI(TAG, "Audio Send Task Started");
-
-    if (!pcm_buf || !send_buf) {
-        ESP_LOGE(TAG, "Failed to allocate audio buffers!");
-        vTaskDelete(NULL);
-    }
 
     while (1) {
         if (gpio_get_level(BUTTON_GPIO) == 0) {
@@ -479,8 +506,6 @@ void audio_send_task(void *arg) {
                 gpio_set_level(LED_GPIO, 1);
                 ESP_LOGI(TAG, "Started Transmitting");
             }
-
-            size_t bytes_read;
             
             #if SINUS_SEND_TO_I2S
             // --- Generate SINUS to pcm_buf ---
@@ -493,23 +518,20 @@ void audio_send_task(void *arg) {
                      if (phase > 2.0f * M_PI) phase -= 2.0f * M_PI;
                 }
             #else
-                // it was: esp_err_t err = i2s_channel_read(rx_handle, pcm_buf, pcm_buf_size, &bytes_read, pdMS_TO_TICKS(300));
+                size_t bytes_read;
                 esp_err_t err = i2s_channel_read(rx_handle, raw_buf, raw_buf_size, &bytes_read, portMAX_DELAY); 
+                if (err != ESP_OK || bytes_read != raw_buf_size) {
+                    ESP_LOGW(TAG, "I2S Read Error or Timeout: %d, bytes: %d", err, bytes_read);
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    continue;
+                }
 
                 for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
-                //  Предположим, данные приходят MSB-first, 24 бита значащие
+                    // Данные приходят MSB-first, 24 бита значащие
                     int32_t sample = (int32_t)(raw_buf[i] << 8);  // Приводим 24-бит к 32-бит со знаком
                     pcm_buf[i] = sample >> 16;  // Масштабируем до 16 бит
                 }
             #endif
-
-            // ESP_LOGI(TAG, "First 5 input samples: %d %d %d %d %d", pcm_buf[0], pcm_buf[1], pcm_buf[2], pcm_buf[3], pcm_buf[4]);
-
-            if (err != ESP_OK || bytes_read != raw_buf_size) {
-                ESP_LOGW(TAG, "I2S Read Error or Timeout: %d, bytes: %d", err, bytes_read);
-                vTaskDelay(pdMS_TO_TICKS(50));
-                continue;
-            }
 
             send_buf[0] = 'A';
             send_buf[1] = 'U';
@@ -556,6 +578,7 @@ void audio_send_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(50));
         }
     }
+
     free(raw_buf);
     free(pcm_buf);
     free(send_buf);
@@ -604,7 +627,8 @@ void audio_receive_task(void *arg) {
             continue;
         }
 
-        if (len >= PACKET_TYPE_PING_LEN && memcmp(rx_buf, PACKET_TYPE_PING, PACKET_TYPE_PING_LEN) == 0) {
+        
+        if (len >= PACKET_TYPE_PING_LEN && memcmp(rx_buf, PACKET_TYPE_PING, PACKET_TYPE_PING_LEN) == 0) { // PING packet
             char received_nick[32] = {0}; // Инициализация нулями
             int nick_len = len - PACKET_TYPE_PING_LEN; // Длина данных после заголовка
     
@@ -638,7 +662,7 @@ void audio_receive_task(void *arg) {
                 ESP_LOGW(TAG, "Failed to take mutex for PING");
             }
         }
-        else if (len > 3 && memcmp(rx_buf, PACKET_TYPE_AUDIO, 3) == 0) {
+        else if (len > 3 && memcmp(rx_buf, PACKET_TYPE_AUDIO, 3) == 0) { // AUD Packet
 
             #if USE_OPUS_CODEC
                 int decoded_samples = opus_decode(opus_decoder, rx_buf + 3, len - 3, decoded_pcm, AUDIO_BLOCK_SIZE, 0);
@@ -682,7 +706,7 @@ void audio_mix_play_task(void *arg) {
     static int32_t i2s_out_buf[AUDIO_BLOCK_SIZE] = {0};
     const size_t i2s_buf_size_bytes = sizeof(i2s_out_buf);
 
-    const int max_shift = 2;  // Максимальное усиление (2^2 = x4)
+    const int max_shift = 0;  // Максимальное усиление (2^2 = x4)
     TickType_t xLastWakeTime = xTaskGetTickCount();
     ESP_LOGI(TAG, "Audio Mix/Play Task Started");
 
@@ -759,23 +783,52 @@ void network_stack_reinit() {
         udp_socket = -1;
     }
 
-    // 3. Правильная последовательность деинициализации
+    // 3. Правильная и полная последовательность деинициализации
+    esp_err_t err;
+
+    // Отписываемся от событий
+    ESP_LOGI(TAG, "Unregistering event handlers...");
+    esp_event_handler_unregister(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler);
+
     if (s_eth_handle) {
         ESP_LOGI(TAG, "Stopping Ethernet...");
-        esp_eth_stop(s_eth_handle);
-        if (s_eth_glue) {
-            esp_eth_del_netif_glue(s_eth_glue);
-            s_eth_glue = NULL;
-        }
-        esp_eth_driver_uninstall(s_eth_handle);
+        err = esp_eth_stop(s_eth_handle);
+        ESP_LOGI(TAG, "esp_eth_stop returned: %s", esp_err_to_name(err));
+    }
+
+    if (s_eth_glue) {
+        err = esp_eth_del_netif_glue(s_eth_glue);
+        ESP_LOGI(TAG, "esp_eth_del_netif_glue returned: %s", esp_err_to_name(err));
+        s_eth_glue = NULL;
+    }
+
+    if (s_eth_handle) {
+        err = esp_eth_driver_uninstall(s_eth_handle);
+        ESP_LOGI(TAG, "esp_eth_driver_uninstall returned: %s", esp_err_to_name(err));
         s_eth_handle = NULL;
     }
-    // Освобождаем шину SPI после того, как драйвер ее отпустил
+
+    if (s_phy) {
+        err = s_phy->del(s_phy);
+        ESP_LOGI(TAG, "phy->del returned: %s", esp_err_to_name(err));
+        s_phy = NULL;
+    }
+
+    if (s_mac) {
+        err = s_mac->del(s_mac);
+        ESP_LOGI(TAG, "mac->del returned: %s", esp_err_to_name(err));
+        s_mac = NULL;
+    }
+
+    // Освобождаем шину SPI после того, как все драйверы ее отпустили
     ESP_LOGI(TAG, "Freeing SPI bus...");
-    spi_bus_free(ETH_SPI_HOST);
+    err = spi_bus_free(ETH_SPI_HOST);
+    ESP_LOGI(TAG, "spi_bus_free returned: %s", esp_err_to_name(err));
 
     if (s_eth_netif) {
         esp_netif_destroy(s_eth_netif);
+        ESP_LOGI(TAG, "esp_netif_destroy called");
         s_eth_netif = NULL;
     }
     
@@ -901,6 +954,7 @@ void app_main(void) {
     // Устанавливаем службу ISR один раз при старте
     gpio_install_isr_service(0);
 
+    init_filters(); // Initialize DSP filters
     init_i2s();
 
     // Checking I2S audio by making a beep test signal
