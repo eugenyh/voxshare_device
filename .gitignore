@@ -26,4 +26,6 @@ Thumbs.db
 #SKB
 *.skb
 
+#BAK
+*.bak
 
