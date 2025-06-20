@@ -1,4 +1,4 @@
-// Ver 0.2FIX
+// Ver 0.250620
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
