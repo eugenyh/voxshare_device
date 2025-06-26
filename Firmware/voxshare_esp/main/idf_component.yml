@@ -2,7 +2,7 @@
 dependencies:
   ## Required IDF version
   idf:
-    version: '>=4.1.0'
+    version: '>=5.4.1'
   # # Put list of dependencies here
   # # For components maintained by Espressif:
   # component: "~1.0.0"
@@ -16,3 +16,7 @@ dependencies:
   #   public: true
   78/esp-opus: ^1.0.5
   espressif/esp-dsp: '*'
+  #lvgl/lvgl: '*'
+  #lvgl/lvgl: ^8.*
+  #inapps/lvgl-st7735: ^1.0.0
+  #lvgl/lvgl_esp32_drivers: ^0.0.3

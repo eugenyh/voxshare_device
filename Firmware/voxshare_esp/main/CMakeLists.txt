@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c"
+    SRCS "main.c" "st7735s_display.c"
     INCLUDE_DIRS "."
     REQUIRES 
         esp-opus 

@@ -19,6 +19,8 @@
 #include "esp_eth.h"
 #include "esp_netif.h"
 #include "esp_eth_netif_glue.h"
+//#include "lwip/ip_addr.h"  // Для ip4addr_ntoa_r()
+
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "esp_timer.h"
@@ -28,18 +30,35 @@
 #include "opus.h"
 #include "esp_dsp.h"
 
+// TFT Display
+#include "st7735s_display.h"  
+
 // --- For beep sample generation ---
 #include "math.h"
 
-#define TAG "VOXSHARE"
+// --- Tags ---
+#define TAG_COMMON       "VOXSHARE"
+#define TAG_RECEIVE_TASK "RECEIVE_TASK"
+#define TAG_SEND_TASK    "SEND_TASK"
+#define TAG_MIX_TASK     "MIX_TASK"
+#define TAG_PING_TASK    "PING_TASK"
+#define TAG_DISPLAY_TASK "DISPLAY_TASK"
 
-#define SINUS_SEND_TO_I2S     0
+// --- Compile options
+#define SINUS_SEND_TO_I2S 0  // Send sinus instead actual audio from MIC
+#define USE_OPUS_CODEC    1  // Use opus enc/dec instead PCM 
+#define ENABLE_TFT        1  // TFT Display support
+#define ENABLE_ENCODER    1  // Encoder support
 
 // --- Configuration ---
+#define DEVICE_PREFIX "ESP32_VSD_"
+
 #define PACKET_TYPE_PING      "PING"
 #define PACKET_TYPE_PING_LEN  4
+
 #define PACKET_TYPE_AUDIO     "AUD"
 #define PACKET_TYPE_AUDIO_LEN 3
+
 #define PING_INTERVAL_MS      2000 // 2 секунды как в Python
 
 #define SAMPLE_RATE      16000
@@ -47,13 +66,9 @@
 #define MAX_CLIENTS      16
 #define MIX_INTERVAL_MS  20
 
-#define USE_OPUS_CODEC        1
 #define OPUS_CHANNELS         1
 #define OPUS_FRAME_SIZE       320 // 20ms at 16kHz
 #define OPUS_MAX_PACKET_SIZE  400 // max 1275
-
-static OpusEncoder *opus_encoder = NULL;
-static OpusDecoder *opus_decoder = NULL;
 
 #define CLIENT_TIMEOUT_MS 5000
 #define CLIENT_NICK_SIZE  32
@@ -71,7 +86,7 @@ static OpusDecoder *opus_decoder = NULL;
 #define BUTTON_GPIO GPIO_NUM_0
 #define LED_GPIO    GPIO_NUM_2
 
-// W5500 SPI Configuration
+// --- W5500 SPI Configuration ---
 #define ETH_SPI_HOST      SPI2_HOST
 #define ETH_SPI_SCLK_GPIO 14
 #define ETH_SPI_MISO_GPIO 12
@@ -81,31 +96,34 @@ static OpusDecoder *opus_decoder = NULL;
 #define ETH_RST_GPIO      16
 #define ETH_SPI_CLOCK_MHZ 20 // Снижено с 40 до 10 для повышения стабильности SPI
 
-// W5500 PHY Configuration
+// --- W5500 PHY Configuration ---
 #define ETH_PHY_ADDR 1
 
-#define DEVICE_PREFIX "ESP32_VSD_"
-
 // --- Global Variables ---
-static char device_nick[32];
+static OpusEncoder *opus_encoder = NULL;
+static OpusDecoder *opus_decoder = NULL;
+
+static char device_nick[CLIENT_NICK_SIZE];
+static char device_ip[16] = {0};
 
 static int udp_socket;
 static struct sockaddr_in mcast_addr;
-static volatile bool is_transmitting = false;
 static i2s_chan_handle_t tx_handle;
 static i2s_chan_handle_t rx_handle;
 static esp_netif_t *s_eth_netif = NULL;
 static esp_eth_handle_t s_eth_handle = NULL;
 static esp_eth_netif_glue_handle_t s_eth_glue = NULL;
+
+static volatile bool is_transmitting = false;
 static volatile bool eth_reinitalizing = false;
+static volatile bool update_display = false;
 
 // Хэндлы задач для их перезапуска
 static TaskHandle_t audio_receive_task_handle = NULL;
 static TaskHandle_t audio_mix_play_task_handle = NULL;
 static TaskHandle_t audio_send_task_handle = NULL;
 static TaskHandle_t ping_task_handle = NULL;
-
-void start_network_tasks(); // Прототип новой функции
+static TaskHandle_t display_update_task_handle = NULL;
 
 typedef struct {
     uint32_t ip_addr;
@@ -126,21 +144,25 @@ const int REINIT_BIT = BIT1; // Новый бит для сигнала о пе�
 void ping_task(void *arg);
 void add_or_update_client(uint32_t ip, int16_t *audio_data, const char* nickname);
 void clear_inactive_clients();
+
 void init_gpio();
 void init_i2s();
+
+static void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
+static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 esp_err_t init_ethernet();
 void init_udp_socket();
+void start_network_tasks(); 
+void network_stack_reinit();
+void network_supervisor_task(void *arg);
+
 void audio_send_task(void *arg);
 void audio_receive_task(void *arg);
 void audio_mix_play_task(void *arg);
-void network_stack_reinit();
-void network_supervisor_task(void *arg);
-static void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
-static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 
 // --- Ping sending ---
 void ping_task(void *arg) {
-    uint8_t ping_packet[128] = {0};
+    uint8_t ping_packet[PACKET_TYPE_PING_LEN + CLIENT_NICK_SIZE] = {0};
     
     while (1) {
         // Формируем ping-пакет (4 байта тип + ник)
@@ -152,21 +174,20 @@ void ping_task(void *arg) {
         size_t ping_len = PACKET_TYPE_PING_LEN + strlen(device_nick);
         
         // Логирование для отладки
-        ESP_LOGD(TAG, "Sending PING (%d bytes): type=%.4s, nick=%s", 
+        ESP_LOGD(TAG_PING_TASK, "Sending PING (%d bytes): type=%.4s, nick=%s", 
                 ping_len, ping_packet, ping_packet + PACKET_TYPE_PING_LEN);
         
-        int sent = sendto(udp_socket, ping_packet, ping_len, 0,
-                          (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
+        int sent = sendto(udp_socket, ping_packet, ping_len, 0, (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
 
         // Точно такая же логика отслеживания ошибок, как в audio_send_task
         static int tx_fail_count = 0;
         const int TX_FAIL_THRESHOLD = 10;
 
         if (sent < 0) {
-            ESP_LOGW(TAG, "Ping sendto failed: errno=%d", errno);
+            ESP_LOGW(TAG_PING_TASK, "Ping sendto failed: errno=%d", errno);
             tx_fail_count++;
             if (tx_fail_count > TX_FAIL_THRESHOLD && !eth_reinitalizing) {
-                ESP_LOGE(TAG, "Too many TX errors in PING task, signaling for network stack re-init...");
+                ESP_LOGE(TAG_PING_TASK, "Too many TX errors in PING task, signaling for network stack re-init...");
                 xEventGroupSetBits(network_event_group, REINIT_BIT);
                 tx_fail_count = 0;
                 vTaskDelay(pdMS_TO_TICKS(5000)); // Пауза, чтобы супервизор успел сработать
@@ -174,7 +195,6 @@ void ping_task(void *arg) {
         } else {
             tx_fail_count = 0;
         }
-
         vTaskDelay(pdMS_TO_TICKS(PING_INTERVAL_MS));
     }
 }
@@ -195,9 +215,7 @@ void add_or_update_client(uint32_t ip, int16_t *audio_data, const char* nickname
                 *p = '_';
             }
         }
-    } else {
-        strncpy(clean_nick, "Unknown", sizeof(clean_nick)-1);
-    }
+    } 
 
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].ip_addr == ip) {
@@ -207,9 +225,16 @@ void add_or_update_client(uint32_t ip, int16_t *audio_data, const char* nickname
                 clients[i].has_audio = true;
             }
 
-            // Всегда обновляем nickname, если он предоставлен
-            strncpy(clients[i].nickname, clean_nick, sizeof(clients[i].nickname)-1);
-            clients[i].nickname[sizeof(clients[i].nickname)-1] = '\0';
+            // Oбновляем nickname, если он есть
+            if (nickname) {
+                if (strcmp(clients[i].nickname, clean_nick) != 0) {
+                    ESP_LOGI(TAG_COMMON, "nickname changed: %s → %s", clients[i].nickname, clean_nick);
+                    strncpy(clients[i].nickname, clean_nick, sizeof(clients[i].nickname) - 1);
+                    clients[i].nickname[sizeof(clients[i].nickname) - 1] = '\0';
+                    // Update display require
+                    update_display = true;
+                }
+            }
 
             clients[i].last_seen = esp_timer_get_time();
             return;
@@ -236,11 +261,12 @@ void add_or_update_client(uint32_t ip, int16_t *audio_data, const char* nickname
             clients[first_empty].has_audio = false;
         }
         
-        ESP_LOGI(TAG, "New client added: %s (%s)", 
-                inet_ntoa(*(struct in_addr *)&ip),
-                clients[first_empty].nickname);
+        // update display require
+        update_display = true;
+
+        ESP_LOGI(TAG_COMMON, "New client added: %s (%s)", inet_ntoa(*(struct in_addr *)&ip), clients[first_empty].nickname);
     } else {
-        ESP_LOGW(TAG, "Max clients reached, ignoring new client. IP: %s", 
+        ESP_LOGW(TAG_COMMON, "Max clients reached, ignoring new client. IP: %s", 
                 inet_ntoa(*(struct in_addr *)&ip));
     }
 }
@@ -260,14 +286,17 @@ void clear_inactive_clients() {
                 timed_out_nicks[timed_out_count][CLIENT_NICK_SIZE - 1] = '\0';
                 timed_out_count++;
             }
+
             memset(&clients[i], 0, sizeof(client_audio_t));
+            // update display require
+            update_display = true;
         }
     }
     // --- Мьютекс будет освобожден после этого в вызывающей функции ---
 
     // --- Эта часть теперь ВНЕ мьютекса ---
     for (int i = 0; i < timed_out_count; i++) {
-        ESP_LOGI(TAG, "Client timed out: %s (%s)",
+        ESP_LOGI(TAG_COMMON, "Client timed out: %s (%s)",
                inet_ntoa(*(struct in_addr *)&timed_out_ips[i]),
                timed_out_nicks[i]);
     }
@@ -324,7 +353,7 @@ void init_i2s() {
     ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
 }
 esp_err_t init_ethernet() {
-    ESP_LOGI(TAG, "Initializing Ethernet...");
+    ESP_LOGI(TAG_COMMON, "Initializing Ethernet...");
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
     s_eth_netif = esp_netif_new(&netif_cfg);
 
@@ -342,7 +371,7 @@ esp_err_t init_ethernet() {
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(ETH_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    ESP_ERROR_CHECK(spi_bus_initialize(ETH_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO)); 
 
     spi_device_interface_config_t devcfg = {
         .mode = 0,
@@ -359,14 +388,17 @@ esp_err_t init_ethernet() {
 
     // Кастомный MAC-адрес
     uint8_t custom_mac[6];
-    esp_read_mac(custom_mac, ESP_MAC_WIFI_STA);
+
+    //esp_read_mac(custom_mac, ESP_MAC_ETH); //ESP_MAC_WIFI_STA
+    esp_efuse_mac_get_default(custom_mac);
+
     custom_mac[0] = 0x02;
     custom_mac[5] += 1;
     ESP_ERROR_CHECK(mac->set_addr(mac, custom_mac));
     // Define device_nick based on device prexix + last 2 MAC bytes 
     snprintf(device_nick, sizeof(device_nick), DEVICE_PREFIX "%02X%02X", custom_mac[4], custom_mac[5]);
 
-    ESP_LOGI(TAG, "Generated device nickname: %s", device_nick);
+    ESP_LOGI(TAG_COMMON, "Generated device nickname: %s", device_nick);
 
     esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
     s_eth_handle = NULL; // Обнуляем перед установкой
@@ -383,16 +415,16 @@ esp_err_t init_ethernet() {
 
     ESP_ERROR_CHECK(esp_eth_start(s_eth_handle));
 
-    ESP_LOGI(TAG, "Initializing Ethernet done.");
+    ESP_LOGI(TAG_COMMON, "Initializing Ethernet done.");
     return ESP_OK;
 }
 
 void init_udp_socket() {
-    ESP_LOGI(TAG, "Initializing UDP Socket");
+    ESP_LOGI(TAG_COMMON, "Initializing UDP Socket");
 
     udp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udp_socket < 0) {
-        ESP_LOGE(TAG, "Failed to create UDP socket: errno %d", errno);
+        ESP_LOGE(TAG_COMMON, "Failed to create UDP socket: errno %d", errno);
         return;
     }
 
@@ -403,7 +435,7 @@ void init_udp_socket() {
     };
 
     if (bind(udp_socket, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
-        ESP_LOGE(TAG, "Failed to bind UDP socket: errno %d", errno);
+        ESP_LOGE(TAG_COMMON, "Failed to bind UDP socket: errno %d", errno);
         close(udp_socket);
         udp_socket = -1;
         return;
@@ -416,7 +448,7 @@ void init_udp_socket() {
     };
 
     if (setsockopt(udp_socket, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-        ESP_LOGE(TAG, "Failed to join multicast group: errno %d", errno);
+        ESP_LOGE(TAG_COMMON, "Failed to join multicast group: errno %d", errno);
         close(udp_socket);
         udp_socket = -1;
         return;
@@ -425,7 +457,7 @@ void init_udp_socket() {
     // Отключаем приём собственных multicast-пакетов
     char loopch = 0;
     if (setsockopt(udp_socket, IPPROTO_IP, IP_MULTICAST_LOOP, &loopch, sizeof(loopch)) < 0) {
-        ESP_LOGW(TAG, "Failed to disable multicast loopback: errno %d", errno);
+        ESP_LOGW(TAG_COMMON, "Failed to disable multicast loopback: errno %d", errno);
     }
 
     // Опционально: выставим TTL для multicast
@@ -438,15 +470,15 @@ void init_udp_socket() {
     mcast_addr.sin_addr.s_addr = inet_addr(MULTICAST_ADDR);
     mcast_addr.sin_port = htons(MULTICAST_PORT);
 
-    ESP_LOGI(TAG, "UDP Socket Initialized for %s:%d", MULTICAST_ADDR, MULTICAST_PORT);
+    ESP_LOGI(TAG_COMMON, "UDP Socket Initialized for %s:%d", MULTICAST_ADDR, MULTICAST_PORT);
 }
 
 // --- Tasks ---
 void audio_send_task(void *arg) {
-    ESP_LOGI(TAG, "Audio Send Task Started");  
-    // ESP_LOGI(TAG, "[Audio Send Task] Free MALLOC_CAP_8BIT/DEFAULT: %u / %u", 
-    //          heap_caps_get_free_size(MALLOC_CAP_8BIT), 
-    //          heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
+    ESP_LOGI(TAG_SEND_TASK, "Audio Send Task Started");  
+    ESP_LOGI(TAG_SEND_TASK, "Free MALLOC_CAP_8BIT/DEFAULT: %u / %u", 
+             heap_caps_get_free_size(MALLOC_CAP_8BIT), 
+             heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
  
     size_t raw_buf_size = AUDIO_BLOCK_SIZE * sizeof(int32_t);
     int32_t *raw_buf = heap_caps_malloc(raw_buf_size, MALLOC_CAP_8BIT); 
@@ -457,13 +489,13 @@ void audio_send_task(void *arg) {
     uint8_t *send_buf = heap_caps_malloc(3 + OPUS_MAX_PACKET_SIZE, MALLOC_CAP_DEFAULT); 
 
     if (!raw_buf || !pcm_buf || !send_buf) {
-        ESP_LOGE(TAG, "Failed to allocate audio buffers!"); 
+        ESP_LOGE(TAG_SEND_TASK, "Failed to allocate audio buffers!"); 
         if (raw_buf) free(raw_buf);
         if (pcm_buf) free(pcm_buf);
         if (send_buf) free(send_buf);       
         vTaskDelete(NULL);
     } else {
-        ESP_LOGI(TAG, "[Audio Send Task] Allocating buffers: RAW %p, PCM %p, SEND %p", raw_buf, pcm_buf, send_buf);
+        ESP_LOGI(TAG_SEND_TASK, "Allocating buffers: RAW %p, PCM %p, SEND %p", raw_buf, pcm_buf, send_buf);
     }
 
     int tx_fail_count = 0;
@@ -475,7 +507,7 @@ void audio_send_task(void *arg) {
             if (!is_transmitting) {
                 is_transmitting = true;
                 gpio_set_level(LED_GPIO, 1);
-                ESP_LOGI(TAG, "Started Transmitting");
+                ESP_LOGI(TAG_SEND_TASK, "Started Transmitting");
             }
 
             size_t bytes_read;
@@ -494,7 +526,7 @@ void audio_send_task(void *arg) {
                 esp_err_t err = i2s_channel_read(rx_handle, raw_buf, raw_buf_size, &bytes_read, portMAX_DELAY);
 
                 if (err != ESP_OK || bytes_read != raw_buf_size) {
-                    ESP_LOGW(TAG, "I2S Read Error or Timeout: %d, bytes: %d", err, bytes_read);
+                    ESP_LOGW(TAG_SEND_TASK, "I2S Read Error or Timeout: %d, bytes: %d", err, bytes_read);
                     vTaskDelay(pdMS_TO_TICKS(50));
                     continue;
                 }
@@ -516,7 +548,7 @@ void audio_send_task(void *arg) {
             #endif
              
             if (encoded_len <= 0 || encoded_len > OPUS_MAX_PACKET_SIZE) {
-                ESP_LOGE(TAG, "Opus encoding failed or too big: %d", encoded_len);
+                ESP_LOGE(TAG_SEND_TASK, "Opus encoding failed or too big: %d", encoded_len);
                 vTaskDelay(pdMS_TO_TICKS(50));
                 continue;
             }
@@ -527,10 +559,10 @@ void audio_send_task(void *arg) {
             int sent = sendto(udp_socket, send_buf, encoded_len + 3, 0, (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
 
             if (sent < 0) {
-                ESP_LOGW(TAG, "UDP sendto failed: errno=%d", errno);
+                ESP_LOGW(TAG_SEND_TASK, "UDP sendto failed: errno=%d", errno);
                 tx_fail_count++;
                 if (tx_fail_count > TX_FAIL_THRESHOLD && !eth_reinitalizing) {
-                    ESP_LOGE(TAG, "Too many TX errors in AUDIO task, signaling for network stack re-init...");
+                    ESP_LOGE(TAG_SEND_TASK, "Too many TX errors in AUDIO task, signaling for network stack re-init...");
                     xEventGroupSetBits(network_event_group, REINIT_BIT);
                     tx_fail_count = 0;
                     vTaskDelay(pdMS_TO_TICKS(5000)); // Пауза, чтобы супервизор успел сработать
@@ -544,7 +576,7 @@ void audio_send_task(void *arg) {
             if (is_transmitting) {
                 is_transmitting = false;
                 gpio_set_level(LED_GPIO, 0);
-                ESP_LOGI(TAG, "Stopped Transmitting");
+                ESP_LOGI(TAG_SEND_TASK, "Stopped Transmitting");
             }
             vTaskDelay(pdMS_TO_TICKS(50));
         }
@@ -555,20 +587,20 @@ void audio_send_task(void *arg) {
 }
 
 void audio_receive_task(void *arg) {
-    ESP_LOGI(TAG, "Audio Receive Task Started");
-    // ESP_LOGI(TAG, "[Audio Receive Task] Free MALLOC_CAP_8BIT/DEFAULT: %u / %u", 
-    //          heap_caps_get_free_size(MALLOC_CAP_8BIT), 
-    //          heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
+    ESP_LOGI(TAG_RECEIVE_TASK, "Audio Receive Task Started");
+    ESP_LOGI(TAG_RECEIVE_TASK, "Free MALLOC_CAP_8BIT/DEFAULT: %u / %u", 
+             heap_caps_get_free_size(MALLOC_CAP_8BIT), 
+             heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
 
     // Выделяем память в куче (DEFAULT достаточно)
     uint8_t *rx_buf = heap_caps_malloc(OPUS_MAX_PACKET_SIZE + 3, MALLOC_CAP_DEFAULT);
     int16_t *decoded_pcm = heap_caps_malloc(sizeof(int16_t) * AUDIO_BLOCK_SIZE, MALLOC_CAP_8BIT);
 
     if (!rx_buf || !decoded_pcm) {
-        ESP_LOGE(TAG, "Failed to allocate memory for audio_receive_task");
+        ESP_LOGE(TAG_RECEIVE_TASK, "Failed to allocate memory for audio_receive_task");
         vTaskDelete(NULL);
     }else {
-        ESP_LOGI(TAG, "[Audio Receive Task] Allocating buffers: RX %p, Decoded %p", rx_buf, decoded_pcm);
+        ESP_LOGI(TAG_RECEIVE_TASK, "Allocating buffers: RX %p, Decoded %p", rx_buf, decoded_pcm);
     }
 
     struct sockaddr_in source_addr;
@@ -580,12 +612,12 @@ void audio_receive_task(void *arg) {
     if (s_eth_netif) {
         if (esp_netif_get_ip_info(s_eth_netif, &ip_info) == ESP_OK) {
             local_ip_addr = ip_info.ip.addr;
-            ESP_LOGI(TAG, "Local IP: " IPSTR, IP2STR(&ip_info.ip));
+            ESP_LOGI(TAG_RECEIVE_TASK, "Local IP: " IPSTR, IP2STR(&ip_info.ip));
         } else {
-            ESP_LOGE(TAG, "Failed to get IP info");
+            ESP_LOGE(TAG_RECEIVE_TASK, "Failed to get IP info");
         }
     } else {
-        ESP_LOGE(TAG, "Ethernet netif handle is NULL");
+        ESP_LOGE(TAG_RECEIVE_TASK, "Ethernet netif handle is NULL");
     }
 
     while (1) {
@@ -593,10 +625,10 @@ void audio_receive_task(void *arg) {
         int len = recvfrom(udp_socket, rx_buf, 3 + OPUS_MAX_PACKET_SIZE, 0, (struct sockaddr *)&source_addr, &socklen);
         int64_t recv_end_time = esp_timer_get_time();
 
-        ESP_LOGD(TAG, "recvfrom took %lld us", recv_end_time - recv_start_time);
+        ESP_LOGD(TAG_RECEIVE_TASK, "recvfrom took %lld us", recv_end_time - recv_start_time);
 
         if (len < 0) {
-            ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
+            ESP_LOGE(TAG_RECEIVE_TASK, "recvfrom failed: errno %d", errno);
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
@@ -620,7 +652,7 @@ void audio_receive_task(void *arg) {
             }
     
             // Логирование для отладки
-            ESP_LOGI(TAG, "Received PING from %s, nick: '%s' (len=%d)", 
+            ESP_LOGI(TAG_RECEIVE_TASK, "Received PING from %s, nick: '%s' (len=%d)", 
                      inet_ntoa(*(struct in_addr *)&source_addr.sin_addr.s_addr),
                      received_nick,
                      nick_len);
@@ -628,11 +660,11 @@ void audio_receive_task(void *arg) {
             int64_t mutex_start_time = esp_timer_get_time();
             if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                int64_t mutex_end_time = esp_timer_get_time();
-               ESP_LOGD(TAG, "Mutex wait time (PING): %lld us", mutex_end_time - mutex_start_time);
+               ESP_LOGD(TAG_RECEIVE_TASK, "Mutex wait time (PING): %lld us", mutex_end_time - mutex_start_time);
                add_or_update_client(source_addr.sin_addr.s_addr, NULL, received_nick);
                xSemaphoreGive(clients_mutex);
             } else {
-                ESP_LOGW(TAG, "Failed to take mutex for PING");
+                ESP_LOGW(TAG_RECEIVE_TASK, "Failed to take mutex for PING");
             }
         }
         else if (len > 3 && memcmp(rx_buf, PACKET_TYPE_AUDIO, 3) == 0) {
@@ -652,15 +684,15 @@ void audio_receive_task(void *arg) {
                     int64_t mutex_start_time = esp_timer_get_time();
                     if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                         int64_t mutex_end_time = esp_timer_get_time();
-                        ESP_LOGD(TAG, "Mutex wait time (AUDIO): %lld us", mutex_end_time - mutex_start_time);
+                        ESP_LOGD(TAG_RECEIVE_TASK, "Mutex wait time (AUDIO): %lld us", mutex_end_time - mutex_start_time);
                         add_or_update_client(sender_ip, decoded_pcm, NULL);
                         xSemaphoreGive(clients_mutex);
                     } else {
-                        ESP_LOGW(TAG, "Failed to take mutex for AUDIO");
+                        ESP_LOGW(TAG_RECEIVE_TASK, "Failed to take mutex for AUDIO");
                     }
                 }
             } else {
-                ESP_LOGE(TAG, "Opus decode failed: %d", decoded_samples);
+                ESP_LOGE(TAG_RECEIVE_TASK, "Opus decode failed: %d", decoded_samples);
             }
         }
 
@@ -677,7 +709,7 @@ void audio_mix_play_task(void *arg) {
     const size_t i2s_buf_size_bytes = sizeof(i2s_out_buf);
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    ESP_LOGI(TAG, "Audio Mix/Play Task Started");
+    ESP_LOGI(TAG_MIX_TASK, "Audio Mix/Play Task Started");
 
     while (1) {
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(MIX_INTERVAL_MS));
@@ -701,7 +733,7 @@ void audio_mix_play_task(void *arg) {
             }
             xSemaphoreGive(clients_mutex);
         } else {
-            ESP_LOGW(TAG, "Mutex timeout in audio task!");
+            ESP_LOGW(TAG_MIX_TASK, "Mutex timeout in audio task!");
             continue;
         }
 
@@ -732,7 +764,7 @@ void audio_mix_play_task(void *arg) {
            size_t bytes_written;
            esp_err_t err = i2s_channel_write(tx_handle, i2s_out_buf, i2s_buf_size_bytes, &bytes_written, portMAX_DELAY);
            if (err != ESP_OK || bytes_written != i2s_buf_size_bytes) {
-               ESP_LOGE(TAG, "I2S error: %d, written: %zu", err, bytes_written);
+               ESP_LOGE(TAG_MIX_TASK, "I2S error: %d, written: %zu", err, bytes_written);
            }
         }
     }
@@ -744,10 +776,10 @@ void network_stack_reinit() {
         return;
     }
     eth_reinitalizing = true;
-    ESP_LOGE(TAG, "--- Starting Network Stack Re-initialization ---");
+    ESP_LOGE(TAG_COMMON, "--- Starting Network Stack Re-initialization ---");
 
     // 1. Удаляем задачи
-    ESP_LOGI(TAG, "Deleting network tasks...");
+    ESP_LOGI(TAG_COMMON, "Deleting network tasks...");
     if (audio_receive_task_handle) vTaskDelete(audio_receive_task_handle);
     if (audio_mix_play_task_handle) vTaskDelete(audio_mix_play_task_handle);
     if (audio_send_task_handle) vTaskDelete(audio_send_task_handle);
@@ -760,14 +792,14 @@ void network_stack_reinit() {
 
     // 2. Закрываем сокет
     if (udp_socket >= 0) {
-        ESP_LOGI(TAG, "Closing UDP socket...");
+        ESP_LOGI(TAG_COMMON, "Closing UDP socket...");
         close(udp_socket);
         udp_socket = -1;
     }
 
     // 3. Правильная последовательность деинициализации
     if (s_eth_handle) {
-        ESP_LOGI(TAG, "Stopping Ethernet...");
+        ESP_LOGI(TAG_COMMON, "Stopping Ethernet...");
         esp_eth_stop(s_eth_handle);
         if (s_eth_glue) {
             esp_eth_del_netif_glue(s_eth_glue);
@@ -777,7 +809,7 @@ void network_stack_reinit() {
         s_eth_handle = NULL;
     }
     // Освобождаем шину SPI после того, как драйвер ее отпустил
-    ESP_LOGI(TAG, "Freeing SPI bus...");
+    ESP_LOGI(TAG_COMMON, "Freeing SPI bus...");
     spi_bus_free(ETH_SPI_HOST);
 
     if (s_eth_netif) {
@@ -788,24 +820,24 @@ void network_stack_reinit() {
     vTaskDelay(pdMS_TO_TICKS(500)); // Даем время на завершение
 
     // 4. Повторная инициализация
-    ESP_LOGI(TAG, "Re-initializing Ethernet hardware...");
+    ESP_LOGI(TAG_COMMON, "Re-initializing Ethernet hardware...");
     ESP_ERROR_CHECK(init_ethernet());
 
     // 5. Ждем нового IP
-    ESP_LOGI(TAG, "Waiting for new IP address...");
+    ESP_LOGI(TAG_COMMON, "Waiting for new IP address...");
     xEventGroupClearBits(network_event_group, GOT_IP_BIT); // Очищаем старый флаг
     EventBits_t bits = xEventGroupWaitBits(network_event_group, GOT_IP_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(30000)); // Ждем 30 сек
     
     // 6. Пересоздаем задачи
     if (bits & GOT_IP_BIT) {
-        ESP_LOGI(TAG, "Got new IP. Restarting network tasks...");
+        ESP_LOGI(TAG_COMMON, "Got new IP. Restarting network tasks...");
         start_network_tasks();
     } else {
-        ESP_LOGE(TAG, "Failed to get new IP address. Restarting...");
+        ESP_LOGE(TAG_COMMON, "Failed to get new IP address. Restarting...");
         esp_restart();
     }
 
-    ESP_LOGI(TAG, "--- Network Stack Re-initialization Finished ---");
+    ESP_LOGI(TAG_COMMON, "--- Network Stack Re-initialization Finished ---");
     eth_reinitalizing = false;
 }
 
@@ -817,19 +849,19 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t ev
     switch (event_id) {
     case ETHERNET_EVENT_CONNECTED:
         esp_netif_get_mac(s_eth_netif, mac_addr);
-        ESP_LOGI(TAG, "Ethernet Link Up");
-        ESP_LOGI(TAG, "Ethernet HW Addr %02x:%02x:%02x:%02x:%02x:%02x",
+        ESP_LOGI(TAG_COMMON, "Ethernet Link Up");
+        ESP_LOGI(TAG_COMMON, "Ethernet HW Addr %02x:%02x:%02x:%02x:%02x:%02x",
                  mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
         break;
     case ETHERNET_EVENT_DISCONNECTED:
-        ESP_LOGI(TAG, "Ethernet Link Down");
+        ESP_LOGI(TAG_COMMON, "Ethernet Link Down");
         xEventGroupClearBits(network_event_group, GOT_IP_BIT);
         break;
     case ETHERNET_EVENT_START:
-        ESP_LOGI(TAG, "Ethernet Started");
+        ESP_LOGI(TAG_COMMON, "Ethernet Started");
         break;
     case ETHERNET_EVENT_STOP:
-        ESP_LOGI(TAG, "Ethernet Stopped");
+        ESP_LOGI(TAG_COMMON, "Ethernet Stopped");
         break;
     default:
         break;
@@ -840,12 +872,15 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t
     ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     const esp_netif_ip_info_t *ip_info = &event->ip_info;
 
-    ESP_LOGI(TAG, "Got IP Address");
-    ESP_LOGI(TAG, "~~~~~~~~~~~");
-    ESP_LOGI(TAG, "ETHIP:" IPSTR, IP2STR(&ip_info->ip));
-    ESP_LOGI(TAG, "ETHMASK:" IPSTR, IP2STR(&ip_info->netmask));
-    ESP_LOGI(TAG, "ETHGW:" IPSTR, IP2STR(&ip_info->gw));
-    ESP_LOGI(TAG, "~~~~~~~~~~~");
+    ESP_LOGI(TAG_COMMON, "Got IP Address");
+    ESP_LOGI(TAG_COMMON, "~~~~~~~~~~~");
+    ESP_LOGI(TAG_COMMON, "ETHIP:" IPSTR, IP2STR(&ip_info->ip));
+    ESP_LOGI(TAG_COMMON, "ETHMASK:" IPSTR, IP2STR(&ip_info->netmask));
+    ESP_LOGI(TAG_COMMON, "ETHGW:" IPSTR, IP2STR(&ip_info->gw));
+    ESP_LOGI(TAG_COMMON, "~~~~~~~~~~~");
+
+    ip4addr_ntoa_r((const ip4_addr_t*)&ip_info->ip, device_ip, sizeof(device_ip));
+
     xEventGroupSetBits(network_event_group, GOT_IP_BIT);
 }
 
@@ -858,7 +893,7 @@ void play_startup_beep() {
     // Allocate buffer for samples
     int16_t *samples = malloc(num_samples * sizeof(int16_t));
     if (!samples) {
-        ESP_LOGE(TAG, "Failed to allocate memory for beep samples");
+        ESP_LOGE(TAG_COMMON, "Failed to allocate memory for beep samples");
         return;
     }
     
@@ -875,13 +910,53 @@ void play_startup_beep() {
                                      portMAX_DELAY); //pdMS_TO_TICKS(100)
     
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG_COMMON, "I2S write failed: %s", esp_err_to_name(ret));
     }
     
     free(samples);
     
     // Add small delay to ensure the beep finishes before continuing
     vTaskDelay(pdMS_TO_TICKS(110));
+}
+
+// TFT Display routines
+void display_task(void *arg) {
+    ESP_LOGI(TAG_DISPLAY_TASK, "Starting display task...");
+
+    static char lisplay_lines[MAX_CLIENTS][CLIENT_NICK_SIZE];
+
+    while (1) {
+        if (update_display) {
+            //Формируем массив данных
+            if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                int line = 0;
+                for (int i = 0; i < MAX_CLIENTS; i++) {
+                    if (clients[i].ip_addr != 0) {
+                        strncpy(lisplay_lines[i], clients[i].nickname, CLIENT_NICK_SIZE - 1);
+                        lisplay_lines[i][CLIENT_NICK_SIZE - 1] = '\0';
+                        line++;
+                    } 
+                }
+                // Отпускаем мьютекс
+                xSemaphoreGive(clients_mutex);
+
+                // Выводим на экран
+                // Clear screen 
+                st7735_clear(TFT_COLOR_BLACK); // black 
+                // Рисуем строки
+                if (line > 0) {
+                    for (int i = 0; i < line; i++) {
+                        st7735_draw_string(0, i*10, lisplay_lines[i], TFT_COLOR_WHITE, TFT_COLOR_BLACK); // белым на черном 
+                    } 
+                } else {
+                    st7735_draw_string(0, 0, "NO PEERS", TFT_COLOR_YELLOW, TFT_COLOR_BLACK); // к на черном 
+                }
+            }
+            update_display = false;
+            ESP_LOGI(TAG_DISPLAY_TASK, "Update display done");
+        }    
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
 }
 
 // --- Main Application ---
@@ -893,15 +968,24 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    // Init display
+    st7735_init();
+
+    display_log("VoxShareESP", TFT_COLOR_BLUE, TFT_COLOR_BLACK); 
+    display_log("Ver 0.7", TFT_COLOR_BLUE, TFT_COLOR_BLACK); 
+
+    display_log("Starting...", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     network_event_group = xEventGroupCreate();
     clients_mutex = xSemaphoreCreateMutex();
     if (clients_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create clients mutex!");
+        ESP_LOGE(TAG_COMMON, "Failed to create clients mutex!");
         return;
     }
+    display_log("Mutex OK", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
 
     init_gpio();
     // Устанавливаем службу ISR один раз при старте
@@ -911,58 +995,75 @@ void app_main(void) {
 
     // Checking I2S audio by making a beep test signal
     play_startup_beep();  
+    display_log("Beep OK", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
     
     // Prepearing OPUS
     #if USE_OPUS_CODEC
 
     int opus_err;
-        ESP_LOGI(TAG, "Using OPUS codec.");
+        ESP_LOGI(TAG_COMMON, "Using OPUS codec.");
         opus_encoder = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_AUDIO, &opus_err);
         if (opus_err != OPUS_OK) {
-            ESP_LOGE(TAG, "Failed to create Opus encoder: %s", opus_strerror(opus_err));
+            ESP_LOGE(TAG_COMMON, "Failed to create Opus encoder: %s", opus_strerror(opus_err));
             return;
         } else {
-                ESP_LOGI(TAG, "OPUS encoder created.");
+                ESP_LOGI(TAG_COMMON, "OPUS encoder created.");
         }
 
         opus_decoder = opus_decoder_create(SAMPLE_RATE, 1, &opus_err);
         if (opus_err != OPUS_OK) {
-            ESP_LOGE(TAG, "Failed to create Opus decoder: %s", opus_strerror(opus_err));
+            ESP_LOGE(TAG_COMMON, "Failed to create Opus decoder: %s", opus_strerror(opus_err));
             return;
         } else {
-                ESP_LOGI(TAG, "OPUS decoder created.");
+                ESP_LOGI(TAG_COMMON, "OPUS decoder created.");
         }
+        display_log("OPUS Enc/Dec OK", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
     #else
         ESP_LOGI(TAG, "Using PCM audio.");
+        display_log("PCM Audio", TFT_COLOR_ORANGE, TFT_COLOR_BLACK); // белым на черном
     #endif
 
     // Init ethernet
     ESP_ERROR_CHECK(init_ethernet());
 
-    ESP_LOGI(TAG, "Waiting for IP address...");
+    ESP_LOGI(TAG_COMMON, "Waiting for IP address...");
+    display_log("Wait IP...", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
     EventBits_t bits = xEventGroupWaitBits(network_event_group, GOT_IP_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
 
     if (bits & GOT_IP_BIT) {
+        display_log("Got IP:   ", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
+        display_log(device_ip, TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
+        // Запускаем сетевые задачи 
         start_network_tasks();
     } else {
-        ESP_LOGE(TAG, "Failed to get IP address. Halting.");
+        ESP_LOGE(TAG_COMMON, "Failed to get IP address. Halting.");
+        display_log("No IP", TFT_COLOR_RED, TFT_COLOR_BLACK); 
+        display_log("Halting", TFT_COLOR_RED, TFT_COLOR_BLACK); 
     }
 
-    ESP_LOGI(TAG, "app_main finished setup.");
+    display_log("Ready", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
+
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    xTaskCreate(display_task, "display_task", 4096, NULL, 3, &display_update_task_handle);
+
+    ESP_LOGI(TAG_COMMON, "app_main finished setup.");
 }
 
 void start_network_tasks() {
-    ESP_LOGI(TAG, "Initializing UDP and starting network tasks...");
+    ESP_LOGI(TAG_COMMON, "Initializing UDP and starting network tasks...");
     init_udp_socket();
     if (udp_socket >= 0) {
+
         xTaskCreate(audio_receive_task, "audio_recv", 28672, NULL, 6, &audio_receive_task_handle);
         xTaskCreate(audio_mix_play_task, "audio_mix", 28672, NULL, 7, &audio_mix_play_task_handle);
         xTaskCreate(audio_send_task, "audio_send", 28672, NULL, 6, &audio_send_task_handle);
         xTaskCreate(ping_task, "ping_task", 4096, NULL, 5, &ping_task_handle);
+        
         xTaskCreate(network_supervisor_task, "net_supervisor", 4096, NULL, 10, NULL); // Создаем супервизора
-        ESP_LOGI(TAG, "Network tasks started.");
+        ESP_LOGI(TAG_COMMON, "Network tasks started.");
     } else {
-        ESP_LOGE(TAG, "UDP socket failed to initialize. Cannot start tasks.");
+        ESP_LOGE(TAG_COMMON, "UDP socket failed to initialize. Cannot start tasks.");
     }
     // После успешного старта всех задач, отключаем "шумные" логи драйвера, чтобы избежать дедлока в будущем.
     esp_log_level_set("w5500.mac", ESP_LOG_NONE);
