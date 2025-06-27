@@ -45,9 +45,9 @@
 
 // --- Tags ---
 #define TAG_COMMON       "VOXSHARE"
-#define TAG_RECEIVE_TASK "RECEIVE_TASK"
-#define TAG_SEND_TASK    "SEND_TASK"
-#define TAG_MIX_TASK     "MIX_TASK"
+#define TAG_RECEIVE_TASK "UDP_RECEIVE_TASK"
+#define TAG_SEND_TASK    "UDP_SEND_TASK"
+#define TAG_MIX_TASK     "AUDIO_MIX_TASK"
 #define TAG_PING_TASK    "PING_TASK"
 #if ENABLE_TFT
 #define TAG_DISPLAY_TASK "DISPLAY_TASK"
@@ -71,7 +71,7 @@
 
 #define OPUS_CHANNELS         1
 #define OPUS_FRAME_SIZE       320 // 20ms at 16kHz
-#define OPUS_MAX_PACKET_SIZE  400 // max 1275
+#define OPUS_MAX_PACKET_SIZE  512 // 400 max 1275
 
 #define CLIENT_TIMEOUT_MS 5000
 #define CLIENT_NICK_SIZE  32
@@ -80,7 +80,7 @@
 #define MULTICAST_PORT 5005
 
 #define I2S_NUM         I2S_NUM_0
-#define I2S_DMA_BUF_LEN 1024
+#define I2S_DMA_BUF_LEN 2048 // 1024
 #define I2S_BCK_IO      26
 #define I2S_WS_IO       25
 #define I2S_DATA_OUT_IO 22
@@ -125,9 +125,9 @@ static volatile bool update_display = false;
 #endif
 
 // Хэндлы задач для их перезапуска
-static TaskHandle_t audio_receive_task_handle = NULL;
+static TaskHandle_t udp_receive_task_handle = NULL;
 static TaskHandle_t audio_mix_play_task_handle = NULL;
-static TaskHandle_t audio_send_task_handle = NULL;
+static TaskHandle_t udp_send_task_handle = NULL;
 static TaskHandle_t ping_task_handle = NULL;
 #if ENABLE_TFT
 static TaskHandle_t display_update_task_handle = NULL;
@@ -162,10 +162,10 @@ void start_network_tasks();
 void network_stack_reinit();
 void network_supervisor_task(void *arg);
 
-void audio_send_task(void *arg);
+void udp_send_task(void *arg);
 
 bool add_or_update_client(uint32_t ip, int16_t *audio_data, const char* nickname);
-void audio_receive_task(void *arg);
+void udp_receive_task(void *arg);
 
 bool clear_inactive_clients();
 void audio_mix_play_task(void *arg);
@@ -381,29 +381,13 @@ void init_udp_socket() {
 }
 
 // --- Tasks ---
-void audio_send_task(void *arg) {
-    ESP_LOGI(TAG_SEND_TASK, "Audio Send Task Started");  
-    ESP_LOGI(TAG_SEND_TASK, "Free MALLOC_CAP_8BIT/DEFAULT: %u / %u", 
-             heap_caps_get_free_size(MALLOC_CAP_8BIT), 
-             heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
+void udp_send_task(void *arg) {
+    ESP_LOGI(TAG_SEND_TASK, "Task Started");  
  
-    size_t raw_buf_size = AUDIO_BLOCK_SIZE * sizeof(int32_t);
-    int32_t *raw_buf = heap_caps_malloc(raw_buf_size, MALLOC_CAP_8BIT); 
-
-    size_t pcm_buf_size = AUDIO_BLOCK_SIZE * sizeof(int16_t);
-    int16_t *pcm_buf = heap_caps_malloc(pcm_buf_size, MALLOC_CAP_8BIT);    
-
-    uint8_t *send_buf = heap_caps_malloc(3 + OPUS_MAX_PACKET_SIZE, MALLOC_CAP_DEFAULT); 
-
-    if (!raw_buf || !pcm_buf || !send_buf) {
-        ESP_LOGE(TAG_SEND_TASK, "Failed to allocate audio buffers!"); 
-        if (raw_buf) free(raw_buf);
-        if (pcm_buf) free(pcm_buf);
-        if (send_buf) free(send_buf);       
-        vTaskDelete(NULL);
-    } else {
-        ESP_LOGI(TAG_SEND_TASK, "Allocating buffers: RAW %p, PCM %p, SEND %p", raw_buf, pcm_buf, send_buf);
-    }
+    int32_t raw_buf[AUDIO_BLOCK_SIZE];
+    int16_t pcm_buf[AUDIO_BLOCK_SIZE];
+    uint8_t send_buf[3 + OPUS_MAX_PACKET_SIZE];
+    const size_t raw_buf_size = sizeof(raw_buf);
 
     int tx_fail_count = 0;
     const int TX_FAIL_THRESHOLD = 10; // Порог ошибок для перезапуска
@@ -487,9 +471,6 @@ void audio_send_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(50));
         }
     }
-    free(raw_buf);
-    free(pcm_buf);
-    free(send_buf);
 }
 
 // --- Client Management ---
@@ -571,22 +552,11 @@ bool add_or_update_client(uint32_t ip, int16_t *audio_data, const char* nickname
     return display_update_require;
 }
 
-void audio_receive_task(void *arg) {
-    ESP_LOGI(TAG_RECEIVE_TASK, "Audio Receive Task Started");
-    ESP_LOGI(TAG_RECEIVE_TASK, "Free MALLOC_CAP_8BIT/DEFAULT: %u / %u", 
-             heap_caps_get_free_size(MALLOC_CAP_8BIT), 
-             heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
+void udp_receive_task(void *arg) {
+    ESP_LOGI(TAG_RECEIVE_TASK, "Task Started");
 
-    // Выделяем память в куче (DEFAULT достаточно)
-    uint8_t *rx_buf = heap_caps_malloc(OPUS_MAX_PACKET_SIZE + 3, MALLOC_CAP_DEFAULT);
-    int16_t *decoded_pcm = heap_caps_malloc(sizeof(int16_t) * AUDIO_BLOCK_SIZE, MALLOC_CAP_8BIT);
-
-    if (!rx_buf || !decoded_pcm) {
-        ESP_LOGE(TAG_RECEIVE_TASK, "Failed to allocate memory for audio_receive_task");
-        vTaskDelete(NULL);
-    }else {
-        ESP_LOGI(TAG_RECEIVE_TASK, "Allocating buffers: RX %p, Decoded %p", rx_buf, decoded_pcm);
-    }
+    uint8_t rx_buf[OPUS_MAX_PACKET_SIZE + 3];
+    int16_t decoded_pcm[AUDIO_BLOCK_SIZE];
 
     struct sockaddr_in source_addr;
     socklen_t socklen = sizeof(source_addr);
@@ -653,7 +623,7 @@ void audio_receive_task(void *arg) {
                if (display_update_reqire) update_display = true;
                #endif
             } else {
-                ESP_LOGW(TAG_RECEIVE_TASK, "Failed to take mutex for PING");
+                ESP_LOGW(TAG_RECEIVE_TASK, "Failed to take mutex (PING packet processing)");
             }
         }
         // --- Processing AUDIO packet ---
@@ -676,7 +646,7 @@ void audio_receive_task(void *arg) {
                         add_or_update_client(sender_ip, decoded_pcm, NULL); // AUDIO packet: no need to update display
                         xSemaphoreGive(clients_mutex);// <=== RELEASE MUTEX 
                     } else {
-                        ESP_LOGW(TAG_RECEIVE_TASK, "Failed to take mutex for AUDIO");
+                        ESP_LOGW(TAG_RECEIVE_TASK, "Failed to take mutex (AUDIO packet processing)");
                     }
 
                 }
@@ -686,9 +656,6 @@ void audio_receive_task(void *arg) {
         }
 
     }
-
-    free(rx_buf);
-    free(decoded_pcm);
 }
 
 bool clear_inactive_clients() {
@@ -711,16 +678,16 @@ bool clear_inactive_clients() {
     }
 
     for (int i = 0; i < timed_out_count; i++) {
-        ESP_LOGD(TAG_COMMON, "Client timed out: %s (%s)", inet_ntoa(*(struct in_addr *)&timed_out_ips[i]), timed_out_nicks[i]);
+        ESP_LOGI(TAG_COMMON, "Client timed out: %s (%s)", inet_ntoa(*(struct in_addr *)&timed_out_ips[i]), timed_out_nicks[i]);
     }
 
     return timed_out_count != 0; // Should return requrement of display update
 }
 
 void audio_mix_play_task(void *arg) {
-    static int32_t mix_accumulator[AUDIO_BLOCK_SIZE] = {0};
-    static int16_t mix_buffer[AUDIO_BLOCK_SIZE] = {0};
-    static int32_t i2s_out_buf[AUDIO_BLOCK_SIZE] = {0};
+    int32_t mix_accumulator[AUDIO_BLOCK_SIZE] = {0};
+    int16_t mix_buffer[AUDIO_BLOCK_SIZE] = {0};
+    int32_t i2s_out_buf[AUDIO_BLOCK_SIZE] = {0};
     const size_t i2s_buf_size_bytes = sizeof(i2s_out_buf);
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -812,13 +779,13 @@ void network_stack_reinit() {
 
     // 1. Удаляем задачи
     ESP_LOGI(TAG_COMMON, "Deleting network tasks...");
-    if (audio_receive_task_handle) vTaskDelete(audio_receive_task_handle);
+    if (udp_receive_task_handle) vTaskDelete(udp_receive_task_handle);
     if (audio_mix_play_task_handle) vTaskDelete(audio_mix_play_task_handle);
-    if (audio_send_task_handle) vTaskDelete(audio_send_task_handle);
+    if (udp_send_task_handle) vTaskDelete(udp_send_task_handle);
     if (ping_task_handle) vTaskDelete(ping_task_handle);
-    audio_receive_task_handle = NULL;
+    udp_receive_task_handle = NULL;
     audio_mix_play_task_handle = NULL;
-    audio_send_task_handle = NULL;
+    udp_send_task_handle = NULL;
     ping_task_handle = NULL;
 
 
@@ -916,7 +883,7 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t
     xEventGroupSetBits(network_event_group, GOT_IP_BIT);
 }
 
-// Beet test signal generation
+// Beep test signal generation
 void play_startup_beep() {
     const float frequency = 3000.0; // 1 kHz tone
     const float duration = 0.1f;    // 100 ms duration
@@ -1002,9 +969,9 @@ void start_network_tasks() {
     init_udp_socket();
     if (udp_socket >= 0) {
 
-        xTaskCreate(audio_receive_task, "audio_recv", 28672, NULL, 6, &audio_receive_task_handle);
+        xTaskCreate(udp_receive_task, "udp_recv", 28672, NULL, 6, &udp_receive_task_handle);
         xTaskCreate(audio_mix_play_task, "audio_mix", 28672, NULL, 7, &audio_mix_play_task_handle);
-        xTaskCreate(audio_send_task, "audio_send", 28672, NULL, 6, &audio_send_task_handle);
+        xTaskCreate(udp_send_task, "udp_send", 28672, NULL, 6, &udp_send_task_handle);
         xTaskCreate(ping_task, "ping_task", 4096, NULL, 5, &ping_task_handle);
         
         xTaskCreate(network_supervisor_task, "net_supervisor", 4096, NULL, 10, NULL); // Создаем супервизора
@@ -1041,7 +1008,7 @@ void app_main(void) {
     display_log("VoxShareESP", TFT_COLOR_BLUE, TFT_COLOR_BLACK); 
     display_log("Ver 0.7", TFT_COLOR_BLUE, TFT_COLOR_BLACK); 
 
-    display_log("Starting...", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
+    display_log("Setup...", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
     #else
     ESP_LOGW(TAG_COMMON, "NOTE: Conpiled without display support.");
     #endif
@@ -1125,16 +1092,13 @@ void app_main(void) {
         #endif
     }
     
-    #if ENABLE_TFT
-    display_log("Ready", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
-    #endif
+    ESP_LOGI(TAG_COMMON, "Setup finished");
 
     #if ENABLE_TFT
+    display_log("Ready", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
     xTaskCreate(display_task, "display_task", 4096, NULL, 3, &display_update_task_handle);
     vTaskDelay(pdMS_TO_TICKS(5000));
     update_display = true;
     #endif
-
-    ESP_LOGI(TAG_COMMON, "app_main finished setup.");
 }
 

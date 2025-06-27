@@ -205,10 +205,13 @@ void reset_log_lines() {
 }
 
 char* adjust_string_width(const char* original_str, size_t width) {
-    // Выделяем память для новой строки: ширина + 1 для терминирующего нуля.
-    char* formatted_str = (char*)malloc(width + 1);
-    if (formatted_str == NULL) {
-        return NULL; // Ошибка выделения памяти
+    // Используем статический буфер. Он выделяется один раз и используется повторно.
+    // Размер 41 выбран с запасом (например, для строк до 40 символов).
+    static char formatted_str[41]; 
+
+    // Добавляем проверку, чтобы избежать переполнения статического буфера
+    if (width >= sizeof(formatted_str)) {
+        width = sizeof(formatted_str) - 1;
     }
 
     // Используем snprintf для форматирования.
