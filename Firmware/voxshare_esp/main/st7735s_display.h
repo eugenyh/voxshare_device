@@ -23,3 +23,5 @@ void st7735_draw_string(uint8_t x, uint8_t y, const char *str, uint16_t color, u
 // Display log feature
 void display_log(const char* msg, uint16_t color, uint16_t bg); 
 void reset_log_lines();
+
+char* adjust_string_width(const char* original_str, size_t width);

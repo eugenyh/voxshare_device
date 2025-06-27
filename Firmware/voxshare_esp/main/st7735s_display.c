@@ -203,3 +203,21 @@ void display_log(const char* msg, uint16_t color, uint16_t bg) {
 void reset_log_lines() {
     current_line = 0;  // Доступ к переменной возможен
 }
+
+char* adjust_string_width(const char* original_str, size_t width) {
+    // Выделяем память для новой строки: ширина + 1 для терминирующего нуля.
+    char* formatted_str = (char*)malloc(width + 1);
+    if (formatted_str == NULL) {
+        return NULL; // Ошибка выделения памяти
+    }
+
+    // Используем snprintf для форматирования.
+    // %-*.*s означает:
+    // - : выравнивание по левому краю
+    // 1-я *: общая ширина поля (width)
+    // 2-я *: максимальное количество символов из исходной строки для копирования (width)
+    // s : исходная строка
+    snprintf(formatted_str, width + 1, "%-*.*s", (int)width, (int)width, original_str);
+
+    return formatted_str;
+}

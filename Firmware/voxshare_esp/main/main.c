@@ -19,7 +19,6 @@
 #include "esp_eth.h"
 #include "esp_netif.h"
 #include "esp_eth_netif_glue.h"
-//#include "lwip/ip_addr.h"  // Для ip4addr_ntoa_r()
 
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
@@ -30,8 +29,16 @@
 #include "opus.h"
 #include "esp_dsp.h"
 
+// --- Compile options
+#define SINUS_SEND_TO_I2S 0  // Send sinus instead actual audio from MIC
+#define USE_OPUS_CODEC    1  // Use opus enc/dec instead PCM 
+#define ENABLE_TFT        1  // TFT Display support
+#define ENABLE_ENCODER    1  // Encoder support
+
 // TFT Display
+#if ENABLE_TFT
 #include "st7735s_display.h"  
+#endif
 
 // --- For beep sample generation ---
 #include "math.h"
@@ -42,13 +49,9 @@
 #define TAG_SEND_TASK    "SEND_TASK"
 #define TAG_MIX_TASK     "MIX_TASK"
 #define TAG_PING_TASK    "PING_TASK"
+#if ENABLE_TFT
 #define TAG_DISPLAY_TASK "DISPLAY_TASK"
-
-// --- Compile options
-#define SINUS_SEND_TO_I2S 0  // Send sinus instead actual audio from MIC
-#define USE_OPUS_CODEC    1  // Use opus enc/dec instead PCM 
-#define ENABLE_TFT        1  // TFT Display support
-#define ENABLE_ENCODER    1  // Encoder support
+#endif
 
 // --- Configuration ---
 #define DEVICE_PREFIX "ESP32_VSD_"
@@ -116,14 +119,19 @@ static esp_eth_netif_glue_handle_t s_eth_glue = NULL;
 
 static volatile bool is_transmitting = false;
 static volatile bool eth_reinitalizing = false;
+
+#if ENABLE_TFT
 static volatile bool update_display = false;
+#endif
 
 // Хэндлы задач для их перезапуска
 static TaskHandle_t audio_receive_task_handle = NULL;
 static TaskHandle_t audio_mix_play_task_handle = NULL;
 static TaskHandle_t audio_send_task_handle = NULL;
 static TaskHandle_t ping_task_handle = NULL;
+#if ENABLE_TFT
 static TaskHandle_t display_update_task_handle = NULL;
+#endif
 
 typedef struct {
     uint32_t ip_addr;
@@ -142,8 +150,6 @@ const int REINIT_BIT = BIT1; // Новый бит для сигнала о пе�
 
 // --- Function Prototypes ---
 void ping_task(void *arg);
-void add_or_update_client(uint32_t ip, int16_t *audio_data, const char* nickname);
-void clear_inactive_clients();
 
 void init_gpio();
 void init_i2s();
@@ -157,7 +163,11 @@ void network_stack_reinit();
 void network_supervisor_task(void *arg);
 
 void audio_send_task(void *arg);
+
+bool add_or_update_client(uint32_t ip, int16_t *audio_data, const char* nickname);
 void audio_receive_task(void *arg);
+
+bool clear_inactive_clients();
 void audio_mix_play_task(void *arg);
 
 // --- Ping sending ---
@@ -196,109 +206,6 @@ void ping_task(void *arg) {
             tx_fail_count = 0;
         }
         vTaskDelay(pdMS_TO_TICKS(PING_INTERVAL_MS));
-    }
-}
-
-// --- Client Management ---
-void add_or_update_client(uint32_t ip, int16_t *audio_data, const char* nickname) {
-    int first_empty = -1;
-    char clean_nick[CLIENT_NICK_SIZE] = {0};
-    
-    // 1. Обработка nickname (улучшенная версия)
-    if (nickname != NULL && nickname[0] != '\0') {  // Проверка на NULL и пустую строку
-        strncpy(clean_nick, nickname, sizeof(clean_nick)-1);
-        clean_nick[sizeof(clean_nick)-1] = '\0';
-        
-        // Дополнительная очистка от непечатных символов
-        for (char *p = clean_nick; *p; p++) {
-            if ((uint8_t)*p < 32 || (uint8_t)*p > 127) {
-                *p = '_';
-            }
-        }
-    } 
-
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].ip_addr == ip) {
-            // Обновление существующего клиента
-            if (audio_data) {
-                memcpy(clients[i].buffer, audio_data, sizeof(int16_t) * AUDIO_BLOCK_SIZE);
-                clients[i].has_audio = true;
-            }
-
-            // Oбновляем nickname, если он есть
-            if (nickname) {
-                if (strcmp(clients[i].nickname, clean_nick) != 0) {
-                    ESP_LOGI(TAG_COMMON, "nickname changed: %s → %s", clients[i].nickname, clean_nick);
-                    strncpy(clients[i].nickname, clean_nick, sizeof(clients[i].nickname) - 1);
-                    clients[i].nickname[sizeof(clients[i].nickname) - 1] = '\0';
-                    // Update display require
-                    update_display = true;
-                }
-            }
-
-            clients[i].last_seen = esp_timer_get_time();
-            return;
-        }
-
-        if (first_empty == -1 && clients[i].ip_addr == 0) {
-            first_empty = i;
-        }
-    }
-
-    // Добавление нового клиента
-    if (first_empty != -1) {
-        clients[first_empty].ip_addr = ip;
-        clients[first_empty].last_seen = esp_timer_get_time();
-        
-        strncpy(clients[first_empty].nickname, clean_nick, sizeof(clients[first_empty].nickname)-1);
-        clients[first_empty].nickname[sizeof(clients[first_empty].nickname)-1] = '\0';
-        
-        if (audio_data) {
-            memcpy(clients[first_empty].buffer, audio_data, sizeof(int16_t) * AUDIO_BLOCK_SIZE);
-            clients[first_empty].has_audio = true;
-        } else {
-            memset(clients[first_empty].buffer, 0, sizeof(int16_t) * AUDIO_BLOCK_SIZE);
-            clients[first_empty].has_audio = false;
-        }
-        
-        // update display require
-        update_display = true;
-
-        ESP_LOGI(TAG_COMMON, "New client added: %s (%s)", inet_ntoa(*(struct in_addr *)&ip), clients[first_empty].nickname);
-    } else {
-        ESP_LOGW(TAG_COMMON, "Max clients reached, ignoring new client. IP: %s", 
-                inet_ntoa(*(struct in_addr *)&ip));
-    }
-}
-
-void clear_inactive_clients() {
-    int64_t now = esp_timer_get_time();
-    uint32_t timed_out_ips[MAX_CLIENTS] = {0};
-    char timed_out_nicks[MAX_CLIENTS][CLIENT_NICK_SIZE] = {0};
-    int timed_out_count = 0;
-
-    // --- Эта часть остается под мьютексом ---
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].ip_addr != 0 && (now - clients[i].last_seen > CLIENT_TIMEOUT_MS * 1000)) {
-            if (timed_out_count < MAX_CLIENTS) {
-                timed_out_ips[timed_out_count] = clients[i].ip_addr;
-                strncpy(timed_out_nicks[timed_out_count], clients[i].nickname, CLIENT_NICK_SIZE -1);
-                timed_out_nicks[timed_out_count][CLIENT_NICK_SIZE - 1] = '\0';
-                timed_out_count++;
-            }
-
-            memset(&clients[i], 0, sizeof(client_audio_t));
-            // update display require
-            update_display = true;
-        }
-    }
-    // --- Мьютекс будет освобожден после этого в вызывающей функции ---
-
-    // --- Эта часть теперь ВНЕ мьютекса ---
-    for (int i = 0; i < timed_out_count; i++) {
-        ESP_LOGI(TAG_COMMON, "Client timed out: %s (%s)",
-               inet_ntoa(*(struct in_addr *)&timed_out_ips[i]),
-               timed_out_nicks[i]);
     }
 }
 
@@ -501,7 +408,6 @@ void audio_send_task(void *arg) {
     int tx_fail_count = 0;
     const int TX_FAIL_THRESHOLD = 10; // Порог ошибок для перезапуска
 
-
     while (1) {
         if (gpio_get_level(BUTTON_GPIO) == 0) {
             if (!is_transmitting) {
@@ -586,6 +492,85 @@ void audio_send_task(void *arg) {
     free(send_buf);
 }
 
+// --- Client Management ---
+bool add_or_update_client(uint32_t ip, int16_t *audio_data, const char* nickname) {
+    int first_empty = -1;
+    char clean_nick[CLIENT_NICK_SIZE] = {0};
+    bool display_update_require = false;
+    
+    // 1. Обработка nickname (улучшенная версия)
+    if (nickname != NULL && nickname[0] != '\0') {  // Проверка на NULL и пустую строку
+        strncpy(clean_nick, nickname, sizeof(clean_nick)-1);
+        clean_nick[sizeof(clean_nick)-1] = '\0';
+        
+        // Дополнительная очистка от непечатных символов
+        for (char *p = clean_nick; *p; p++) {
+            if ((uint8_t)*p < 32 || (uint8_t)*p > 127) {
+                *p = '_';
+            }
+        }
+    } 
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].ip_addr == ip) {
+            // Обновление существующего клиента
+            if (audio_data) {
+                memcpy(clients[i].buffer, audio_data, sizeof(int16_t) * AUDIO_BLOCK_SIZE);
+                clients[i].has_audio = true;
+            }
+
+            // Oбновляем nickname, если он есть
+            if (nickname) {
+                if (strcmp(clients[i].nickname, clean_nick) != 0) {
+                    ESP_LOGI(TAG_COMMON, "nickname changed: %s → %s", clients[i].nickname, clean_nick);
+                    strncpy(clients[i].nickname, clean_nick, sizeof(clients[i].nickname) - 1);
+                    clients[i].nickname[sizeof(clients[i].nickname) - 1] = '\0';
+                    #if ENABLE_TFT
+                    // Update display require
+                    display_update_require = true;
+                    #endif
+                }
+            }
+
+            clients[i].last_seen = esp_timer_get_time();
+            return display_update_require;
+        }
+
+        if (first_empty == -1 && clients[i].ip_addr == 0) {
+            first_empty = i;
+        }
+    }
+
+    // Добавление нового клиента
+    if (first_empty != -1) {
+        clients[first_empty].ip_addr = ip;
+        clients[first_empty].last_seen = esp_timer_get_time();
+        
+        strncpy(clients[first_empty].nickname, clean_nick, sizeof(clients[first_empty].nickname)-1);
+        clients[first_empty].nickname[sizeof(clients[first_empty].nickname)-1] = '\0';
+        
+        if (audio_data) {
+            memcpy(clients[first_empty].buffer, audio_data, sizeof(int16_t) * AUDIO_BLOCK_SIZE);
+            clients[first_empty].has_audio = true;
+        } else {
+            memset(clients[first_empty].buffer, 0, sizeof(int16_t) * AUDIO_BLOCK_SIZE);
+            clients[first_empty].has_audio = false;
+        }
+        
+        #if ENABLE_TFT
+        // update display require
+        display_update_require = true;
+        #endif
+
+        ESP_LOGI(TAG_COMMON, "New client added: %s (%s)", inet_ntoa(*(struct in_addr *)&ip), clients[first_empty].nickname);
+    } else {
+        ESP_LOGW(TAG_COMMON, "Max clients reached, ignoring new client. IP: %s", 
+                inet_ntoa(*(struct in_addr *)&ip));
+    }
+
+    return display_update_require;
+}
+
 void audio_receive_task(void *arg) {
     ESP_LOGI(TAG_RECEIVE_TASK, "Audio Receive Task Started");
     ESP_LOGI(TAG_RECEIVE_TASK, "Free MALLOC_CAP_8BIT/DEFAULT: %u / %u", 
@@ -622,6 +607,7 @@ void audio_receive_task(void *arg) {
 
     while (1) {
         int64_t recv_start_time = esp_timer_get_time();
+        // Reading UDP socket
         int len = recvfrom(udp_socket, rx_buf, 3 + OPUS_MAX_PACKET_SIZE, 0, (struct sockaddr *)&source_addr, &socklen);
         int64_t recv_end_time = esp_timer_get_time();
 
@@ -633,9 +619,10 @@ void audio_receive_task(void *arg) {
             continue;
         }
 
+        // --- Processing PING packet ---
         if (len >= PACKET_TYPE_PING_LEN && memcmp(rx_buf, PACKET_TYPE_PING, PACKET_TYPE_PING_LEN) == 0) {
-            char received_nick[32] = {0}; // Инициализация нулями
-            int nick_len = len - PACKET_TYPE_PING_LEN; // Длина данных после заголовка
+            char received_nick[32] = {0}; // Fill by 0
+            int nick_len = len - PACKET_TYPE_PING_LEN; // Data length after header
     
             // Копируем только фактически полученные данные
             if (nick_len > 0) {
@@ -657,16 +644,19 @@ void audio_receive_task(void *arg) {
                      received_nick,
                      nick_len);
     
-            int64_t mutex_start_time = esp_timer_get_time();
-            if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-               int64_t mutex_end_time = esp_timer_get_time();
-               ESP_LOGD(TAG_RECEIVE_TASK, "Mutex wait time (PING): %lld us", mutex_end_time - mutex_start_time);
-               add_or_update_client(source_addr.sin_addr.s_addr, NULL, received_nick);
-               xSemaphoreGive(clients_mutex);
+            if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) == pdTRUE) { // <=== TAKE MUTEX
+               bool display_update_reqire = add_or_update_client(source_addr.sin_addr.s_addr, NULL, received_nick);
+               xSemaphoreGive(clients_mutex); // <== RELEASE MUTEX
+
+               #if ENABLE_TFT
+               // update display if require
+               if (display_update_reqire) update_display = true;
+               #endif
             } else {
                 ESP_LOGW(TAG_RECEIVE_TASK, "Failed to take mutex for PING");
             }
         }
+        // --- Processing AUDIO packet ---
         else if (len > 3 && memcmp(rx_buf, PACKET_TYPE_AUDIO, 3) == 0) {
 
             #if USE_OPUS_CODEC
@@ -681,15 +671,14 @@ void audio_receive_task(void *arg) {
 
                 // Игнорируем собственные пакеты, если передача активна
                 if (!is_transmitting && sender_ip != local_ip_addr) {
-                    int64_t mutex_start_time = esp_timer_get_time();
-                    if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                        int64_t mutex_end_time = esp_timer_get_time();
-                        ESP_LOGD(TAG_RECEIVE_TASK, "Mutex wait time (AUDIO): %lld us", mutex_end_time - mutex_start_time);
-                        add_or_update_client(sender_ip, decoded_pcm, NULL);
-                        xSemaphoreGive(clients_mutex);
+                    
+                    if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) == pdTRUE) { // <== TAKE MUTEX
+                        add_or_update_client(sender_ip, decoded_pcm, NULL); // AUDIO packet: no need to update display
+                        xSemaphoreGive(clients_mutex);// <=== RELEASE MUTEX 
                     } else {
                         ESP_LOGW(TAG_RECEIVE_TASK, "Failed to take mutex for AUDIO");
                     }
+
                 }
             } else {
                 ESP_LOGE(TAG_RECEIVE_TASK, "Opus decode failed: %d", decoded_samples);
@@ -700,6 +689,32 @@ void audio_receive_task(void *arg) {
 
     free(rx_buf);
     free(decoded_pcm);
+}
+
+bool clear_inactive_clients() {
+    int64_t now = esp_timer_get_time();
+    uint32_t timed_out_ips[MAX_CLIENTS] = {0};
+    char timed_out_nicks[MAX_CLIENTS][CLIENT_NICK_SIZE] = {0};
+    int timed_out_count = 0;
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].ip_addr != 0 && (now - clients[i].last_seen > CLIENT_TIMEOUT_MS * 1000)) {
+            if (timed_out_count < MAX_CLIENTS) {
+                timed_out_ips[timed_out_count] = clients[i].ip_addr;
+                strncpy(timed_out_nicks[timed_out_count], clients[i].nickname, CLIENT_NICK_SIZE -1);
+                timed_out_nicks[timed_out_count][CLIENT_NICK_SIZE - 1] = '\0';
+                timed_out_count++;
+            }
+            // Clear client
+            memset(&clients[i], 0, sizeof(client_audio_t));
+        }
+    }
+
+    for (int i = 0; i < timed_out_count; i++) {
+        ESP_LOGD(TAG_COMMON, "Client timed out: %s (%s)", inet_ntoa(*(struct in_addr *)&timed_out_ips[i]), timed_out_nicks[i]);
+    }
+
+    return timed_out_count != 0; // Should return requrement of display update
 }
 
 void audio_mix_play_task(void *arg) {
@@ -716,57 +731,74 @@ void audio_mix_play_task(void *arg) {
         if (is_transmitting) continue;
 
 
+        // --- Clearing and mixing process ---
         int active_clients = 0;
         memset(mix_accumulator, 0, sizeof(mix_accumulator));
-        // Accumulate all clients buffers to one accumutator
-        if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            clear_inactive_clients();
+        if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(10)) == pdTRUE) { // <=== TAKE MUTEX
+            // Drop all inactive clients
+            bool display_update_reqire = clear_inactive_clients();
+
+            // And accumulate all active clients buffers into accumutator
             for (int i = 0; i < MAX_CLIENTS; i++) {
 
                 if (clients[i].ip_addr != 0 && clients[i].has_audio) {
                     for (int j = 0; j < AUDIO_BLOCK_SIZE; j++) {
-                         mix_accumulator[j] += (int32_t)clients[i].buffer[j];
+                         mix_accumulator[j] += (int32_t)clients[i].buffer[j]; //collect int16_t samples into int32_t value
                     }
                     clients[i].has_audio = false;
                     active_clients++;
                 }
             }
-            xSemaphoreGive(clients_mutex);
+            xSemaphoreGive(clients_mutex); // <=== RELEASE MUTEX
+
+            #if ENABLE_TFT
+            // Update display if somebody was dropped
+            if (display_update_reqire) update_display = true;
+            #endif            
+
         } else {
             ESP_LOGW(TAG_MIX_TASK, "Mutex timeout in audio task!");
             continue;
         }
 
-        if (active_clients > 0) { // have data to manupulate and out
+        // --- Audio data processing and out --- 
+        if (active_clients > 0) { // have data to manupulate
             memset(mix_buffer, 0, sizeof(mix_buffer));
+
+            // Averaging and clipping
             for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
-            // Усреднение
-            int32_t sample = mix_accumulator[i] / active_clients;
+                // Averaging
+                int32_t sample = mix_accumulator[i] / active_clients;
 
-            // Клиппинг (на случай, если было переполнение)
-            if (sample > INT16_MAX) sample = INT16_MAX;
-            if (sample < INT16_MIN) sample = INT16_MIN;
+                // Clipping
+                if (sample > INT16_MAX) sample = INT16_MAX;
+                if (sample < INT16_MIN) sample = INT16_MIN;
 
-            mix_buffer[i] = (int16_t)sample;
+                mix_buffer[i] = (int16_t)sample;
             }
 
            // Convert PCM to 24bit I2S data
            memset(i2s_out_buf, 0, sizeof(i2s_out_buf));
            for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
-               //int16_t pcm_sample = mix_buffer[i];
-               //float normalized_sample_f = (float)pcm_sample / 32767.0f;
-               //int32_t sample24 = (int32_t)(normalized_sample_f * 8388607.0f / 3);
-               //i2s_out_buf[i] = sample24 << 8;
 
-               i2s_out_buf[i] = ((int32_t)mix_buffer[i] * 4194304LL / 32767) << 8; //8388607LL
+               // Algorythm:
+               //    int16_t pcm_sample = mix_buffer[i];
+               //    float normalized_sample_f = (float)pcm_sample / 32767.0f;
+               //    int32_t sample24 = (int32_t)(normalized_sample_f * 8388607.0f / 3);
+               //    i2s_out_buf[i] = sample24 << 8;
+
+               i2s_out_buf[i] = ((int32_t)mix_buffer[i] * 4194304LL / 32767) << 8; // Using 4194304 (not 8388607) for decrease volume of sound
            }
 
+           // Audio out
            size_t bytes_written;
            esp_err_t err = i2s_channel_write(tx_handle, i2s_out_buf, i2s_buf_size_bytes, &bytes_written, portMAX_DELAY);
            if (err != ESP_OK || bytes_written != i2s_buf_size_bytes) {
                ESP_LOGE(TAG_MIX_TASK, "I2S error: %d, written: %zu", err, bytes_written);
            }
+
         }
+
     }
 
 }
@@ -919,6 +951,7 @@ void play_startup_beep() {
     vTaskDelay(pdMS_TO_TICKS(110));
 }
 
+#if ENABLE_TFT
 // TFT Display routines
 void display_task(void *arg) {
     ESP_LOGI(TAG_DISPLAY_TASK, "Starting display task...");
@@ -928,7 +961,7 @@ void display_task(void *arg) {
     while (1) {
         if (update_display) {
             //Формируем массив данных
-            if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {  // <=== TAKE MUTEX
                 int line = 0;
                 for (int i = 0; i < MAX_CLIENTS; i++) {
                     if (clients[i].ip_addr != 0) {
@@ -937,118 +970,32 @@ void display_task(void *arg) {
                         line++;
                     } 
                 }
-                // Отпускаем мьютекс
-                xSemaphoreGive(clients_mutex);
+                xSemaphoreGive(clients_mutex); // <=== RELEASE MUTEX
 
                 // Выводим на экран
                 // Clear screen 
                 st7735_clear(TFT_COLOR_BLACK); // black 
                 // Рисуем строки
                 if (line > 0) {
+                    st7735_draw_string(0, 0, adjust_string_width("ALL", 16), TFT_COLOR_BLACK, TFT_COLOR_WHITE); // к на черном 
                     for (int i = 0; i < line; i++) {
-                        st7735_draw_string(0, i*10, lisplay_lines[i], TFT_COLOR_WHITE, TFT_COLOR_BLACK); // белым на черном 
+                        st7735_draw_string(0, 10 + i*10, adjust_string_width(lisplay_lines[i], 16), TFT_COLOR_WHITE, TFT_COLOR_BLACK); // белым на черном 
                     } 
                 } else {
                     st7735_draw_string(0, 0, "NO PEERS", TFT_COLOR_YELLOW, TFT_COLOR_BLACK); // к на черном 
                 }
+
+                update_display = false;
+                ESP_LOGI(TAG_DISPLAY_TASK, "Update display done");
+
+            } else {
+                ESP_LOGW(TAG_RECEIVE_TASK, "Failed to take mutex for display update");
             }
-            update_display = false;
-            ESP_LOGI(TAG_DISPLAY_TASK, "Update display done");
         }    
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
-
-// --- Main Application ---
-void app_main(void) {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    // Init display
-    st7735_init();
-
-    display_log("VoxShareESP", TFT_COLOR_BLUE, TFT_COLOR_BLACK); 
-    display_log("Ver 0.7", TFT_COLOR_BLUE, TFT_COLOR_BLACK); 
-
-    display_log("Starting...", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
-
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-    network_event_group = xEventGroupCreate();
-    clients_mutex = xSemaphoreCreateMutex();
-    if (clients_mutex == NULL) {
-        ESP_LOGE(TAG_COMMON, "Failed to create clients mutex!");
-        return;
-    }
-    display_log("Mutex OK", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
-
-    init_gpio();
-    // Устанавливаем службу ISR один раз при старте
-    gpio_install_isr_service(0);
-
-    init_i2s();
-
-    // Checking I2S audio by making a beep test signal
-    play_startup_beep();  
-    display_log("Beep OK", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
-    
-    // Prepearing OPUS
-    #if USE_OPUS_CODEC
-
-    int opus_err;
-        ESP_LOGI(TAG_COMMON, "Using OPUS codec.");
-        opus_encoder = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_AUDIO, &opus_err);
-        if (opus_err != OPUS_OK) {
-            ESP_LOGE(TAG_COMMON, "Failed to create Opus encoder: %s", opus_strerror(opus_err));
-            return;
-        } else {
-                ESP_LOGI(TAG_COMMON, "OPUS encoder created.");
-        }
-
-        opus_decoder = opus_decoder_create(SAMPLE_RATE, 1, &opus_err);
-        if (opus_err != OPUS_OK) {
-            ESP_LOGE(TAG_COMMON, "Failed to create Opus decoder: %s", opus_strerror(opus_err));
-            return;
-        } else {
-                ESP_LOGI(TAG_COMMON, "OPUS decoder created.");
-        }
-        display_log("OPUS Enc/Dec OK", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
-    #else
-        ESP_LOGI(TAG, "Using PCM audio.");
-        display_log("PCM Audio", TFT_COLOR_ORANGE, TFT_COLOR_BLACK); // белым на черном
-    #endif
-
-    // Init ethernet
-    ESP_ERROR_CHECK(init_ethernet());
-
-    ESP_LOGI(TAG_COMMON, "Waiting for IP address...");
-    display_log("Wait IP...", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
-    EventBits_t bits = xEventGroupWaitBits(network_event_group, GOT_IP_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
-
-    if (bits & GOT_IP_BIT) {
-        display_log("Got IP:   ", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
-        display_log(device_ip, TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
-        // Запускаем сетевые задачи 
-        start_network_tasks();
-    } else {
-        ESP_LOGE(TAG_COMMON, "Failed to get IP address. Halting.");
-        display_log("No IP", TFT_COLOR_RED, TFT_COLOR_BLACK); 
-        display_log("Halting", TFT_COLOR_RED, TFT_COLOR_BLACK); 
-    }
-
-    display_log("Ready", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
-
-    vTaskDelay(pdMS_TO_TICKS(5000));
-
-    xTaskCreate(display_task, "display_task", 4096, NULL, 3, &display_update_task_handle);
-
-    ESP_LOGI(TAG_COMMON, "app_main finished setup.");
-}
+#endif
 
 void start_network_tasks() {
     ESP_LOGI(TAG_COMMON, "Initializing UDP and starting network tasks...");
@@ -1077,3 +1024,117 @@ void network_supervisor_task(void *arg) {
         }
     }
 }
+
+// --- Main Application ---
+void app_main(void) {
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    #if ENABLE_TFT
+    // Init display
+    st7735_init();
+
+    display_log("VoxShareESP", TFT_COLOR_BLUE, TFT_COLOR_BLACK); 
+    display_log("Ver 0.7", TFT_COLOR_BLUE, TFT_COLOR_BLACK); 
+
+    display_log("Starting...", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
+    #else
+    ESP_LOGW(TAG_COMMON, "NOTE: Conpiled without display support.");
+    #endif
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    network_event_group = xEventGroupCreate();
+    clients_mutex = xSemaphoreCreateMutex();
+    if (clients_mutex == NULL) {
+        ESP_LOGE(TAG_COMMON, "Failed to create clients mutex!");
+        return;
+    }
+    #if ENABLE_TFT
+    display_log("Mutex OK", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
+    #endif
+
+    init_gpio();
+    // Устанавливаем службу ISR один раз при старте
+    gpio_install_isr_service(0);
+
+    init_i2s();
+
+    // Checking I2S audio by making a beep test signal
+    play_startup_beep();  
+    #if ENABLE_TFT
+    display_log("Beep OK", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
+    #endif
+    
+    // Prepearing OPUS
+    #if USE_OPUS_CODEC
+
+    int opus_err;
+        ESP_LOGI(TAG_COMMON, "Using OPUS codec.");
+        opus_encoder = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_AUDIO, &opus_err);
+        if (opus_err != OPUS_OK) {
+            ESP_LOGE(TAG_COMMON, "Failed to create Opus encoder: %s", opus_strerror(opus_err));
+            return;
+        } else {
+                ESP_LOGI(TAG_COMMON, "OPUS encoder created.");
+        }
+
+        opus_decoder = opus_decoder_create(SAMPLE_RATE, 1, &opus_err);
+        if (opus_err != OPUS_OK) {
+            ESP_LOGE(TAG_COMMON, "Failed to create Opus decoder: %s", opus_strerror(opus_err));
+            return;
+        } else {
+                ESP_LOGI(TAG_COMMON, "OPUS decoder created.");
+        }
+        #if ENABLE_TFT
+        display_log("OPUS Enc/Dec OK", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
+        #endif
+    #else
+        ESP_LOGI(TAG, "Using PCM audio.");
+        #if ENABLE_TFT
+        display_log("PCM Audio", TFT_COLOR_ORANGE, TFT_COLOR_BLACK); // белым на черном
+        #endif
+    #endif
+
+    // Init ethernet
+    ESP_ERROR_CHECK(init_ethernet());
+
+    ESP_LOGI(TAG_COMMON, "Waiting for IP address...");
+    #if ENABLE_TFT
+    display_log("Wait IP...", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
+    #endif
+    EventBits_t bits = xEventGroupWaitBits(network_event_group, GOT_IP_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+
+    if (bits & GOT_IP_BIT) {
+        #if ENABLE_TFT
+        display_log("Got IP:   ", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
+        display_log(device_ip, TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
+        #endif
+        // Запускаем сетевые задачи 
+        start_network_tasks();
+    } else {
+        ESP_LOGE(TAG_COMMON, "Failed to get IP address. Halting.");
+        #if ENABLE_TFT
+        display_log("No IP", TFT_COLOR_RED, TFT_COLOR_BLACK); 
+        display_log("Halting", TFT_COLOR_RED, TFT_COLOR_BLACK); 
+        #endif
+    }
+    
+    #if ENABLE_TFT
+    display_log("Ready", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
+    #endif
+
+    #if ENABLE_TFT
+    xTaskCreate(display_task, "display_task", 4096, NULL, 3, &display_update_task_handle);
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    update_display = true;
+    #endif
+
+    ESP_LOGI(TAG_COMMON, "app_main finished setup.");
+}
+
