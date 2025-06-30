@@ -12,4 +12,5 @@ idf_component_register(
         driver
         esp_timer
         esp_system
+        encoder_service
  )

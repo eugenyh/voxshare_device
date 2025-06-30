@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -29,6 +30,10 @@
 #include "opus.h"
 #include "esp_dsp.h"
 
+
+#include "driver/pulse_cnt.h"
+
+
 // --- Compile options
 #define SINUS_SEND_TO_I2S 0  // Send sinus instead actual audio from MIC
 #define USE_OPUS_CODEC    1  // Use opus enc/dec instead PCM 
@@ -49,9 +54,15 @@
 #define TAG_SEND_TASK    "UDP_SEND_TASK"
 #define TAG_MIX_TASK     "AUDIO_MIX_TASK"
 #define TAG_PING_TASK    "PING_TASK"
+
 #if ENABLE_TFT
 #define TAG_DISPLAY_TASK "DISPLAY_TASK"
 #endif
+
+#if ENABLE_ENCODER
+#include "encoder_service.h"
+#endif
+
 
 // --- Configuration ---
 #define DEVICE_PREFIX "ESP32_VSD_"
@@ -102,6 +113,13 @@
 // --- W5500 PHY Configuration ---
 #define ETH_PHY_ADDR 1
 
+// Encoder
+#if ENABLE_ENCODER
+#define ENCODER_S1  27
+#define ENCODER_S2  33
+#define ENCODER_KEY 21
+#endif
+
 // --- Global Variables ---
 static OpusEncoder *opus_encoder = NULL;
 static OpusDecoder *opus_decoder = NULL;
@@ -117,6 +135,8 @@ static esp_netif_t *s_eth_netif = NULL;
 static esp_eth_handle_t s_eth_handle = NULL;
 static esp_eth_netif_glue_handle_t s_eth_glue = NULL;
 
+static volatile int total_clients_count = 0;
+
 static volatile bool is_transmitting = false;
 static volatile bool eth_reinitalizing = false;
 
@@ -124,11 +144,16 @@ static volatile bool eth_reinitalizing = false;
 static volatile bool update_display = false;
 #endif
 
+#if ENABLE_ENCODER
+static volatile int current_line = 0;
+#endif
+
 // Хэндлы задач для их перезапуска
 static TaskHandle_t udp_receive_task_handle = NULL;
 static TaskHandle_t audio_mix_play_task_handle = NULL;
 static TaskHandle_t udp_send_task_handle = NULL;
 static TaskHandle_t ping_task_handle = NULL;
+
 #if ENABLE_TFT
 static TaskHandle_t display_update_task_handle = NULL;
 #endif
@@ -259,6 +284,7 @@ void init_i2s() {
     ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
     ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
 }
+
 esp_err_t init_ethernet() {
     ESP_LOGI(TAG_COMMON, "Initializing Ethernet...");
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
@@ -543,6 +569,8 @@ bool add_or_update_client(uint32_t ip, int16_t *audio_data, const char* nickname
         display_update_require = true;
         #endif
 
+        total_clients_count++;
+
         ESP_LOGI(TAG_COMMON, "New client added: %s (%s)", inet_ntoa(*(struct in_addr *)&ip), clients[first_empty].nickname);
     } else {
         ESP_LOGW(TAG_COMMON, "Max clients reached, ignoring new client. IP: %s", 
@@ -674,6 +702,7 @@ bool clear_inactive_clients() {
             }
             // Clear client
             memset(&clients[i], 0, sizeof(client_audio_t));
+            total_clients_count--;
         }
     }
 
@@ -699,7 +728,7 @@ void audio_mix_play_task(void *arg) {
 
 
         // --- Clearing and mixing process ---
-        int active_clients = 0;
+        int active_clients_count = 0;
         memset(mix_accumulator, 0, sizeof(mix_accumulator));
         if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(10)) == pdTRUE) { // <=== TAKE MUTEX
             // Drop all inactive clients
@@ -713,7 +742,7 @@ void audio_mix_play_task(void *arg) {
                          mix_accumulator[j] += (int32_t)clients[i].buffer[j]; //collect int16_t samples into int32_t value
                     }
                     clients[i].has_audio = false;
-                    active_clients++;
+                    active_clients_count++;
                 }
             }
             xSemaphoreGive(clients_mutex); // <=== RELEASE MUTEX
@@ -729,13 +758,13 @@ void audio_mix_play_task(void *arg) {
         }
 
         // --- Audio data processing and out --- 
-        if (active_clients > 0) { // have data to manupulate
+        if (active_clients_count > 0) { // have data to manupulate
             memset(mix_buffer, 0, sizeof(mix_buffer));
 
             // Averaging and clipping
             for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
                 // Averaging
-                int32_t sample = mix_accumulator[i] / active_clients;
+                int32_t sample = mix_accumulator[i] / active_clients_count;
 
                 // Clipping
                 if (sample > INT16_MAX) sample = INT16_MAX;
@@ -754,7 +783,7 @@ void audio_mix_play_task(void *arg) {
                //    int32_t sample24 = (int32_t)(normalized_sample_f * 8388607.0f / 3);
                //    i2s_out_buf[i] = sample24 << 8;
 
-               i2s_out_buf[i] = ((int32_t)mix_buffer[i] * 4194304LL / 32767) << 8; // Using 4194304 (not 8388607) for decrease volume of sound
+               i2s_out_buf[i] = ((int32_t)mix_buffer[i] * 8388607LL / 32767) << 8; // Using 4194304 (not 8388607) for decrease volume of sound
            }
 
            // Audio out
@@ -923,7 +952,7 @@ void play_startup_beep() {
 void display_task(void *arg) {
     ESP_LOGI(TAG_DISPLAY_TASK, "Starting display task...");
 
-    static char lisplay_lines[MAX_CLIENTS][CLIENT_NICK_SIZE];
+    char display_lines[MAX_CLIENTS][CLIENT_NICK_SIZE];
 
     while (1) {
         if (update_display) {
@@ -932,8 +961,8 @@ void display_task(void *arg) {
                 int line = 0;
                 for (int i = 0; i < MAX_CLIENTS; i++) {
                     if (clients[i].ip_addr != 0) {
-                        strncpy(lisplay_lines[i], clients[i].nickname, CLIENT_NICK_SIZE - 1);
-                        lisplay_lines[i][CLIENT_NICK_SIZE - 1] = '\0';
+                        strncpy(display_lines[line], clients[i].nickname, CLIENT_NICK_SIZE - 1);
+                        display_lines[line][CLIENT_NICK_SIZE - 1] = '\0';
                         line++;
                     } 
                 }
@@ -946,7 +975,7 @@ void display_task(void *arg) {
                 if (line > 0) {
                     st7735_draw_string(0, 0, adjust_string_width("ALL", 16), TFT_COLOR_BLACK, TFT_COLOR_WHITE); // к на черном 
                     for (int i = 0; i < line; i++) {
-                        st7735_draw_string(0, 10 + i*10, adjust_string_width(lisplay_lines[i], 16), TFT_COLOR_WHITE, TFT_COLOR_BLACK); // белым на черном 
+                        st7735_draw_string(0, 10 + i*10, adjust_string_width(display_lines[i], 16), TFT_COLOR_WHITE, TFT_COLOR_BLACK); // белым на черном 
                     } 
                 } else {
                     st7735_draw_string(0, 0, "NO PEERS", TFT_COLOR_YELLOW, TFT_COLOR_BLACK); // к на черном 
@@ -962,7 +991,37 @@ void display_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
-#endif
+#endif 
+
+#if ENABLE_ENCODER
+void encoder_event_task(void *arg) {
+    QueueHandle_t q = encoder_service_get_event_queue();
+    encoder_event_t evt;
+
+    while (1) {
+        if (xQueueReceive(q, &evt, portMAX_DELAY)) {
+            switch (evt.type) {
+                case ENCODER_EVENT_ROTATE:
+                    // ESP_LOGI("ENCODER", "Rotate %+d", (int)evt.rotate_delta);
+                    current_line += (int)evt.rotate_delta;
+                    if (current_line < 0) current_line = total_clients_count;
+                    if (current_line > total_clients_count) current_line = 0;
+                    ESP_LOGI("ENCODER", "Total clients:%d; current line %d", total_clients_count, current_line);
+                    break;
+                case ENCODER_EVENT_BUTTON_CLICK:
+                    ESP_LOGI("ENCODER", "Click");
+                    break;
+                case ENCODER_EVENT_BUTTON_DOUBLE_CLICK:
+                    ESP_LOGI("ENCODER", "Double Click");
+                    break;
+                case ENCODER_EVENT_BUTTON_LONG_PRESS:
+                    ESP_LOGI("ENCODER", "Long Press");
+                    break;
+            }
+        }
+    }
+}
+#endif 
 
 void start_network_tasks() {
     ESP_LOGI(TAG_COMMON, "Initializing UDP and starting network tasks...");
@@ -1032,12 +1091,7 @@ void app_main(void) {
 
     init_i2s();
 
-    // Checking I2S audio by making a beep test signal
-    play_startup_beep();  
-    #if ENABLE_TFT
-    display_log("Beep OK", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
-    #endif
-    
+ 
     // Prepearing OPUS
     #if USE_OPUS_CODEC
 
@@ -1092,6 +1146,20 @@ void app_main(void) {
         #endif
     }
     
+    #if ENABLE_ENCODER
+    //Init encoder
+    ESP_LOGI(TAG_COMMON, "Enable encoder");
+    encoder_service_init(ENCODER_S1, ENCODER_S2, ENCODER_KEY);
+    encoder_service_start();
+    xTaskCreate(encoder_event_task, "encoder_event_task", 2048, NULL, 5, NULL);    
+    #endif
+
+    // Checking I2S audio by making a beep test signal
+    play_startup_beep();  
+    #if ENABLE_TFT
+    display_log("Beep OK", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
+    #endif
+
     ESP_LOGI(TAG_COMMON, "Setup finished");
 
     #if ENABLE_TFT
