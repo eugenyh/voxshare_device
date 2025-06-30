@@ -15,7 +15,7 @@
 #define TFT_COLOR_PINK       0xFC9F     // 💖 Розовый
 #define TFT_COLOR_GRAY       0x8410     // ◼️ Серый
 
-void st7735_init(void);
+void st7735_init(int LCD_HOST, int SPI_CLOCK_SPEED_MHZ, int PIN_NUM_DC, int PIN_NUM_RST, int PIN_NUM_MOSI, int PIN_NUM_CLK, int PIN_NUM_CS);
 void st7735_clear(uint16_t color);
 void st7735_draw_char(uint8_t x, uint8_t y, char ch, uint16_t color, uint16_t bg);
 void st7735_draw_string(uint8_t x, uint8_t y, const char *str, uint16_t color, uint16_t bg);

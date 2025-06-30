@@ -6,16 +6,6 @@
 #include "st7735s_display.h"
 #include "font8x8_basic.h"
 
-
-// TFT Display SPI Configuration
-#define LCD_HOST     SPI3_HOST
-#define PIN_NUM_MOSI 23
-#define PIN_NUM_CLK  18
-#define PIN_NUM_CS   15
-#define PIN_NUM_DC   2
-#define PIN_NUM_RST  17
-#define PIN_NUM_BCKL 21   
-
 #define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT 160
 
@@ -26,6 +16,9 @@
 #define Y_OFFSET 1
 
 static spi_device_handle_t spi;
+
+static int CUR_PIN_NUM_RST;
+static int CUR_PIN_NUM_DC;
 
 // Logging feature
 static uint8_t current_line = 0;  
@@ -42,7 +35,7 @@ static uint8_t reverse_bits(uint8_t b) {
 }
 
 static void lcd_cmd(uint8_t cmd) {
-    gpio_set_level(PIN_NUM_DC, 0);
+    gpio_set_level(CUR_PIN_NUM_DC, 0);
     spi_transaction_t t = {
         .length = 8,
         .tx_buffer = &cmd
@@ -51,7 +44,7 @@ static void lcd_cmd(uint8_t cmd) {
 }
 
 static void lcd_data(const uint8_t *data, int len) {
-    gpio_set_level(PIN_NUM_DC, 1);
+    gpio_set_level(CUR_PIN_NUM_DC, 1);
     while (len > 0) {
         int chunk = (len > 64) ? 64 : len;
 
@@ -69,9 +62,9 @@ static void lcd_data(const uint8_t *data, int len) {
 }
 
 static void lcd_reset(void) {
-    gpio_set_level(PIN_NUM_RST, 0);
+    gpio_set_level(CUR_PIN_NUM_RST, 0);
     vTaskDelay(pdMS_TO_TICKS(50));
-    gpio_set_level(PIN_NUM_RST, 1);
+    gpio_set_level(CUR_PIN_NUM_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(50));
 }
 
@@ -96,9 +89,12 @@ static void set_address_window(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1) {
     lcd_cmd(0x2C); // Memory write
 }
 
-void st7735_init(void) {
+void st7735_init(int LCD_HOST, int SPI_CLOCK_SPEED_MHZ, int PIN_NUM_DC, int PIN_NUM_RST, int PIN_NUM_MOSI, int PIN_NUM_CLK, int PIN_NUM_CS) {
+    CUR_PIN_NUM_DC = PIN_NUM_DC;
+    CUR_PIN_NUM_RST = PIN_NUM_RST;
+    
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << PIN_NUM_DC) | (1ULL << PIN_NUM_RST),
+        .pin_bit_mask = (1ULL << CUR_PIN_NUM_DC) | (1ULL << CUR_PIN_NUM_RST),
         .mode = GPIO_MODE_OUTPUT
     };
     gpio_config(&io_conf);
@@ -114,7 +110,7 @@ void st7735_init(void) {
     spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_DISABLED);
 
     spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 8 * 1000 * 1000,
+        .clock_speed_hz = SPI_CLOCK_SPEED_MHZ * 1000 * 1000,
         .mode = 0,
         .spics_io_num = PIN_NUM_CS,
         .queue_size = 7,

@@ -30,10 +30,6 @@
 #include "opus.h"
 #include "esp_dsp.h"
 
-
-#include "driver/pulse_cnt.h"
-
-
 // --- Compile options
 #define SINUS_SEND_TO_I2S 0  // Send sinus instead actual audio from MIC
 #define USE_OPUS_CODEC    1  // Use opus enc/dec instead PCM 
@@ -63,15 +59,17 @@
 #include "encoder_service.h"
 #endif
 
-
 // --- Configuration ---
 #define DEVICE_PREFIX "ESP32_VSD_"
 
-#define PACKET_TYPE_PING      "PING"
-#define PACKET_TYPE_PING_LEN  4
+#define PACKET_TYPE_PING        "PING"
+#define PACKET_TYPE_PING_LEN    4
 
-#define PACKET_TYPE_AUDIO     "AUD"
-#define PACKET_TYPE_AUDIO_LEN 3
+#define PACKET_TYPE_AUDIO       "AUD"
+#define PACKET_TYPE_AUDIO_LEN   3
+
+#define PACKET_TYPE_AUDIO_C     "AUC"
+#define PACKET_TYPE_AUDIO_C_LEN 3
 
 #define PING_INTERVAL_MS      2000 // 2 секунды как в Python
 
@@ -97,8 +95,11 @@
 #define I2S_DATA_OUT_IO 22
 #define I2S_DATA_IN_IO  19
 
+// SPEAK button
 #define BUTTON_GPIO GPIO_NUM_0
-#define LED_GPIO    GPIO_NUM_2
+
+// MIC active led
+#define LED_GPIO GPIO_NUM_27
 
 // --- W5500 SPI Configuration ---
 #define ETH_SPI_HOST      SPI2_HOST
@@ -108,14 +109,24 @@
 #define ETH_CS_GPIO       5
 #define ETH_INT_GPIO      4
 #define ETH_RST_GPIO      16
-#define ETH_SPI_CLOCK_MHZ 20 // Снижено с 40 до 10 для повышения стабильности SPI
+#define ETH_SPI_CLOCK_MHZ 20 // Снижено с 40 до 20 для повышения стабильности SPI
 
 // --- W5500 PHY Configuration ---
 #define ETH_PHY_ADDR 1
 
+// TFT Display SPI Configuration
+#define TFT_CLOCK_SPEED_MHZ 15 
+#define TFT_HOST            SPI3_HOST
+#define TFT_NUM_MOSI        23
+#define TFT_NUM_CLK         18
+#define TFT_NUM_CS          15
+#define TFT_NUM_DC          2
+#define TFT_NUM_RST         17
+#define TFT_NUM_BCKL        21   
+
 // Encoder
 #if ENABLE_ENCODER
-#define ENCODER_S1  27
+#define ENCODER_S1  32
 #define ENCODER_S2  33
 #define ENCODER_KEY 21
 #endif
@@ -637,10 +648,7 @@ void udp_receive_task(void *arg) {
             }
     
             // Логирование для отладки
-            ESP_LOGI(TAG_RECEIVE_TASK, "Received PING from %s, nick: '%s' (len=%d)", 
-                     inet_ntoa(*(struct in_addr *)&source_addr.sin_addr.s_addr),
-                     received_nick,
-                     nick_len);
+            // ESP_LOGI(TAG_RECEIVE_TASK, "Received PING from %s, nick: '%s' (len=%d)", inet_ntoa(*(struct in_addr *)&source_addr.sin_addr.s_addr), received_nick, nick_len);
     
             if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) == pdTRUE) { // <=== TAKE MUTEX
                bool display_update_reqire = add_or_update_client(source_addr.sin_addr.s_addr, NULL, received_nick);
@@ -973,9 +981,35 @@ void display_task(void *arg) {
                 st7735_clear(TFT_COLOR_BLACK); // black 
                 // Рисуем строки
                 if (line > 0) {
-                    st7735_draw_string(0, 0, adjust_string_width("ALL", 16), TFT_COLOR_BLACK, TFT_COLOR_WHITE); // к на черном 
+                    uint16_t TXT_COLOR; 
+                    uint16_t BG_COLOR; 
+
+                    // draw top line
+                    if (current_line == 0) {
+                        // selected
+                        TXT_COLOR =  TFT_COLOR_BLACK;
+                        BG_COLOR = TFT_COLOR_WHITE;
+                    } else {
+                        // unselected
+                        TXT_COLOR =  TFT_COLOR_WHITE;
+                        BG_COLOR = TFT_COLOR_BLACK;
+                    }
+                    st7735_draw_string(0, 0, adjust_string_width("ALL", 16), TXT_COLOR, BG_COLOR); 
+
+                    // draw the rest one
                     for (int i = 0; i < line; i++) {
-                        st7735_draw_string(0, 10 + i*10, adjust_string_width(display_lines[i], 16), TFT_COLOR_WHITE, TFT_COLOR_BLACK); // белым на черном 
+
+                        if ((i+1) == current_line) {
+                            // selected
+                            TXT_COLOR =  TFT_COLOR_BLACK;
+                            BG_COLOR = TFT_COLOR_WHITE;
+                        } else {
+                           // unselected
+                           TXT_COLOR =  TFT_COLOR_WHITE;
+                           BG_COLOR = TFT_COLOR_BLACK;
+                        }
+
+                        st7735_draw_string(0, 10 + i * 10, adjust_string_width(display_lines[i], 16), TXT_COLOR, BG_COLOR); // белым на черном 
                     } 
                 } else {
                     st7735_draw_string(0, 0, "NO PEERS", TFT_COLOR_YELLOW, TFT_COLOR_BLACK); // к на черном 
@@ -1003,10 +1037,14 @@ void encoder_event_task(void *arg) {
             switch (evt.type) {
                 case ENCODER_EVENT_ROTATE:
                     // ESP_LOGI("ENCODER", "Rotate %+d", (int)evt.rotate_delta);
+                    int previous_line = current_line;
                     current_line += (int)evt.rotate_delta;
                     if (current_line < 0) current_line = total_clients_count;
                     if (current_line > total_clients_count) current_line = 0;
-                    ESP_LOGI("ENCODER", "Total clients:%d; current line %d", total_clients_count, current_line);
+                    // ESP_LOGI("ENCODER", "Total clients:%d; current line %d", total_clients_count, current_line);
+                    #if ENABLE_TFT
+                    if (previous_line != current_line) update_display = true;
+                    #endif
                     break;
                 case ENCODER_EVENT_BUTTON_CLICK:
                     ESP_LOGI("ENCODER", "Click");
@@ -1062,7 +1100,7 @@ void app_main(void) {
 
     #if ENABLE_TFT
     // Init display
-    st7735_init();
+    st7735_init(TFT_HOST, TFT_CLOCK_SPEED_MHZ, TFT_NUM_DC, TFT_NUM_RST, TFT_NUM_MOSI, TFT_NUM_CLK, TFT_NUM_CS);
 
     display_log("VoxShareESP", TFT_COLOR_BLUE, TFT_COLOR_BLACK); 
     display_log("Ver 0.7", TFT_COLOR_BLUE, TFT_COLOR_BLACK); 
@@ -1091,10 +1129,8 @@ void app_main(void) {
 
     init_i2s();
 
- 
     // Prepearing OPUS
     #if USE_OPUS_CODEC
-
     int opus_err;
         ESP_LOGI(TAG_COMMON, "Using OPUS codec.");
         opus_encoder = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_AUDIO, &opus_err);
