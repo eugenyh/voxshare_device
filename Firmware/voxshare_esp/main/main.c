@@ -30,6 +30,8 @@
 #include "opus.h"
 #include "esp_dsp.h"
 
+#include "init_sound.h"
+
 // --- Compile options
 #define SINUS_SEND_TO_I2S 0  // Send sinus instead actual audio from MIC
 #define USE_OPUS_CODEC    1  // Use opus enc/dec instead PCM 
@@ -124,7 +126,7 @@
 #define TFT_NUM_RST         17
 #define TFT_NUM_BCKL        21   
 
-// Encoder
+// EC11 Encoder configuration
 #if ENABLE_ENCODER
 #define ENCODER_S1  32
 #define ENCODER_S2  33
@@ -921,6 +923,22 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t
 }
 
 // Beep test signal generation
+void play_init_sound() {
+    // Send data through I2S
+    size_t bytes_written = 0;
+    esp_err_t ret = i2s_channel_write(tx_handle, init_sound, 
+                                     init_sound_length * sizeof(int32_t), 
+                                     &bytes_written, 
+                                     portMAX_DELAY); //pdMS_TO_TICKS(100)
+    
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_COMMON, "I2S write failed: %s", esp_err_to_name(ret));
+    }
+    
+    // Add small delay to ensure the beep finishes before continuing
+    vTaskDelay(pdMS_TO_TICKS(110));
+}
+
 void play_startup_beep() {
     const float frequency = 3000.0; // 1 kHz tone
     const float duration = 0.1f;    // 100 ms duration
@@ -1191,7 +1209,8 @@ void app_main(void) {
     #endif
 
     // Checking I2S audio by making a beep test signal
-    play_startup_beep();  
+    // play_startup_beep();  
+    play_init_sound();
     #if ENABLE_TFT
     display_log("Beep OK", TFT_COLOR_GREEN, TFT_COLOR_BLACK); 
     #endif
