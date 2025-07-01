@@ -677,8 +677,9 @@ void udp_receive_task(void *arg) {
             if (decoded_samples == AUDIO_BLOCK_SIZE) {
                 uint32_t sender_ip = source_addr.sin_addr.s_addr;
 
-                // Игнорируем собственные пакеты, если передача активна
-                if (!is_transmitting && sender_ip != local_ip_addr) {
+                // Игнорируем собственные пакеты
+                // (!is_transmitting && sender_ip != local_ip_addr)
+                if (sender_ip != local_ip_addr) {
                     
                     if (xSemaphoreTake(clients_mutex, pdMS_TO_TICKS(100)) == pdTRUE) { // <== TAKE MUTEX
                         add_or_update_client(sender_ip, decoded_pcm, NULL); // AUDIO packet: no need to update display
@@ -726,15 +727,21 @@ bool clear_inactive_clients() {
 void audio_mix_play_task(void *arg) {
     int32_t mix_accumulator[AUDIO_BLOCK_SIZE] = {0};
     int16_t mix_buffer[AUDIO_BLOCK_SIZE] = {0};
+
     int32_t i2s_out_buf[AUDIO_BLOCK_SIZE] = {0};
+    int32_t i2s_silence_buf[AUDIO_BLOCK_SIZE] = {0};
     const size_t i2s_buf_size_bytes = sizeof(i2s_out_buf);
+
+    for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
+        i2s_silence_buf[i] = 0x800000; // или 0x800000 если нужно DC offset
+    }
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
     ESP_LOGI(TAG_MIX_TASK, "Audio Mix/Play Task Started");
 
     while (1) {
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(MIX_INTERVAL_MS));
-        if (is_transmitting) continue;
+        // if (is_transmitting) continue;
 
 
         // --- Clearing and mixing process ---
@@ -768,6 +775,8 @@ void audio_mix_play_task(void *arg) {
         }
 
         // --- Audio data processing and out --- 
+        size_t i2s_bytes_written;
+        esp_err_t err;
         if (active_clients_count > 0) { // have data to manupulate
             memset(mix_buffer, 0, sizeof(mix_buffer));
 
@@ -796,13 +805,18 @@ void audio_mix_play_task(void *arg) {
                i2s_out_buf[i] = ((int32_t)mix_buffer[i] * 8388607LL / 32767) << 8; // Using 4194304 (not 8388607) for decrease volume of sound
            }
 
-           // Audio out
-           size_t bytes_written;
-           esp_err_t err = i2s_channel_write(tx_handle, i2s_out_buf, i2s_buf_size_bytes, &bytes_written, portMAX_DELAY);
-           if (err != ESP_OK || bytes_written != i2s_buf_size_bytes) {
-               ESP_LOGE(TAG_MIX_TASK, "I2S error: %d, written: %zu", err, bytes_written);
+           // Audio data out
+           err = i2s_channel_write(tx_handle, i2s_out_buf, i2s_buf_size_bytes, &i2s_bytes_written, portMAX_DELAY);
+           if (err != ESP_OK || i2s_bytes_written != i2s_buf_size_bytes) {
+               ESP_LOGE(TAG_MIX_TASK, "I2S error (datas): %d, written: %zu", err, i2s_bytes_written);
            }
 
+        } else {
+           // Audio silence out
+           err = i2s_channel_write(tx_handle, i2s_silence_buf, i2s_buf_size_bytes, &i2s_bytes_written, portMAX_DELAY);
+           if (err != ESP_OK || i2s_bytes_written != i2s_buf_size_bytes) {
+               ESP_LOGE(TAG_MIX_TASK, "I2S error (silence): %d, written: %zu", err, i2s_bytes_written);
+           }
         }
 
     }
