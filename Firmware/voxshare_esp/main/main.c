@@ -732,9 +732,9 @@ void audio_mix_play_task(void *arg) {
     int32_t i2s_silence_buf[AUDIO_BLOCK_SIZE] = {0};
     const size_t i2s_buf_size_bytes = sizeof(i2s_out_buf);
 
-    for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
-        i2s_silence_buf[i] = 0x800000; // или 0x800000 если нужно DC offset
-    }
+    // for (int i = 0; i < AUDIO_BLOCK_SIZE; i++) {
+    //    i2s_silence_buf[i] = 0x800000; // или 0x800000 если нужно DC offset
+    // }
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
     ESP_LOGI(TAG_MIX_TASK, "Audio Mix/Play Task Started");
@@ -802,7 +802,7 @@ void audio_mix_play_task(void *arg) {
                //    int32_t sample24 = (int32_t)(normalized_sample_f * 8388607.0f / 3);
                //    i2s_out_buf[i] = sample24 << 8;
 
-               i2s_out_buf[i] = ((int32_t)mix_buffer[i] * 8388607LL / 32767) << 8; // Using 4194304 (not 8388607) for decrease volume of sound
+               i2s_out_buf[i] = ((int32_t)mix_buffer[i] * 8388607LL / 32767) << 8; 
            }
 
            // Audio data out
