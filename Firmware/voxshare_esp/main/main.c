@@ -37,6 +37,7 @@
 #define USE_OPUS_CODEC    1  // Use opus enc/dec instead PCM 
 #define ENABLE_TFT        1  // TFT Display support
 #define ENABLE_ENCODER    1  // Encoder support
+#define ENABLE_RELAY      1  // Relay support
 
 // TFT Display
 #if ENABLE_TFT
@@ -72,6 +73,9 @@
 
 #define PACKET_TYPE_AUDIO_C     "AUC"
 #define PACKET_TYPE_AUDIO_C_LEN 3
+
+#define PACKET_TYPE_COMAND      "CMD"
+#define PACKET_TYPE_COMMAND_LEN 3
 
 #define PING_INTERVAL_MS      2000 // 2 секунды как в Python
 
@@ -128,9 +132,14 @@
 
 // EC11 Encoder configuration
 #if ENABLE_ENCODER
-#define ENCODER_S1  32
-#define ENCODER_S2  33
+#define ENCODER_S1  34
+#define ENCODER_S2  35
 #define ENCODER_KEY 21
+#endif
+
+// Relay configuration
+#if ENABLE_RELAY
+#define RELAY_GPIO  33
 #endif
 
 // --- Global Variables ---
@@ -267,6 +276,18 @@ void init_gpio() {
     };
     gpio_config(&io_conf_led);
     gpio_set_level(LED_GPIO, 0);
+
+    #if ENABLE_RELAY
+    gpio_config_t io_conf_relay = {
+        .pin_bit_mask = (1ULL << RELAY_GPIO),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE
+     };
+    gpio_config(&io_conf_relay);
+    gpio_set_level(RELAY_GPIO, 0);
+    #endif
 }
 
 void init_i2s() {
